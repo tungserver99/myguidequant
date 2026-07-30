@@ -12,9 +12,10 @@ import time
 from .utils import get_progress_bar
 
 try:
-    from .pair_triton import solve_pair_monotone_triton, triton_pair_available
+    from .pair_triton import solve_pair_bruteforce_k2_triton, solve_pair_monotone_triton, triton_pair_available
 except Exception:
     solve_pair_monotone_triton = None
+    solve_pair_bruteforce_k2_triton = None
 
     def triton_pair_available() -> bool:
         return False
@@ -314,6 +315,53 @@ def solve_pair_monotone(
 
 
 
+def solve_pair_bruteforce_k2_fast(
+    W_i: torch.Tensor,
+    W_j: torch.Tensor,
+    C_grp: torch.Tensor,
+    e_i_current: torch.Tensor,
+    e_j_current: torch.Tensor,
+    z_i: torch.Tensor,
+    z_j: torch.Tensor,
+    H_ii: torch.Tensor,
+    H_jj: torch.Tensor,
+    H_ij: torch.Tensor,
+) -> PairSolveResult:
+    if (
+        solve_pair_bruteforce_k2_triton is not None
+        and triton_pair_available()
+        and W_i.is_cuda
+        and C_grp.dtype in (torch.float16, torch.float32)
+    ):
+        label_i, label_j, error_i, error_j, cost = solve_pair_bruteforce_k2_triton(
+            W_i,
+            W_j,
+            C_grp,
+            e_i_current,
+            e_j_current,
+            z_i,
+            z_j,
+            H_ii,
+            H_jj,
+            H_ij,
+        )
+        return PairSolveResult(label_i, label_j, error_i, error_j, cost)
+
+    return solve_pair_bruteforce(
+        W_i,
+        W_j,
+        C_grp,
+        e_i_current,
+        e_j_current,
+        z_i,
+        z_j,
+        H_ii,
+        H_jj,
+        H_ij,
+    )
+
+
+
 def solve_pair_monotone_fast(
     W_i: torch.Tensor,
     W_j: torch.Tensor,
@@ -376,6 +424,7 @@ def update_P_pair(
     C: torch.Tensor,
     cd_cycles: int,
     verbose: bool = True,
+    pair_solver: Literal["monotone", "k2"] = "monotone",
 ):
     device = W.device
     W = W.to(device)
@@ -424,7 +473,10 @@ def update_P_pair(
     W_grp = W_perm.reshape(num_groups, group_size, d)
     C_grp = C.reshape(num_groups, group_size, C.shape[-1])
     assignments_grp = assignments_perm.reshape(num_groups, group_size, d)
-    C_sorted, sorted_to_original = torch.sort(C_grp, dim=-1)
+    if pair_solver == "monotone":
+        C_sorted, sorted_to_original = torch.sort(C_grp, dim=-1)
+    else:
+        C_sorted, sorted_to_original = None, None
     E = torch.gather(C_grp, dim=-1, index=assignments_grp.long()).reshape(num_groups, group_size, d) - W_grp
     _log_step("codebook sort and error init", prepare_start)
 
@@ -437,7 +489,12 @@ def update_P_pair(
     pb = get_progress_bar(update_size, "Updating P pair") if verbose else None
     changed_pairs = torch.zeros((), dtype=torch.long, device=device)
 
-    pair_backend = "triton-monotone-exact" if triton_pair_available() and W.is_cuda else "torch-monotone-exact"
+    if pair_solver == "monotone":
+        pair_backend = "triton-monotone-exact" if triton_pair_available() and W.is_cuda else "torch-monotone-exact"
+    elif pair_solver == "k2":
+        pair_backend = "triton-bruteforce-k2-exact" if triton_pair_available() and W.is_cuda else "torch-bruteforce-k2-exact"
+    else:
+        raise ValueError(f"Unsupported pair solver: {pair_solver}")
     if verbose:
         logging.info(f"assignment solver: pair")
         logging.info(f"pair backend: {pair_backend}")
@@ -470,20 +527,34 @@ def update_P_pair(
                 if verbose:
                     old_label_i = assignments_grp[:, :, i].clone()
                     old_label_j = assignments_grp[:, :, j].clone()
-                result = solve_pair_monotone_fast(
-                    W_grp[:, :, i],
-                    W_grp[:, :, j],
-                    C_grp,
-                    E[:, :, i],
-                    E[:, :, j],
-                    Z[:, :, i],
-                    Z[:, :, j],
-                    H_perm[:, i, i],
-                    H_perm[:, j, j],
-                    H_perm[:, i, j],
-                    C_sorted=C_sorted,
-                    sorted_to_original=sorted_to_original,
-                )
+                if pair_solver == "monotone":
+                    result = solve_pair_monotone_fast(
+                        W_grp[:, :, i],
+                        W_grp[:, :, j],
+                        C_grp,
+                        E[:, :, i],
+                        E[:, :, j],
+                        Z[:, :, i],
+                        Z[:, :, j],
+                        H_perm[:, i, i],
+                        H_perm[:, j, j],
+                        H_perm[:, i, j],
+                        C_sorted=C_sorted,
+                        sorted_to_original=sorted_to_original,
+                    )
+                else:
+                    result = solve_pair_bruteforce_k2_fast(
+                        W_grp[:, :, i],
+                        W_grp[:, :, j],
+                        C_grp,
+                        E[:, :, i],
+                        E[:, :, j],
+                        Z[:, :, i],
+                        Z[:, :, j],
+                        H_perm[:, i, i],
+                        H_perm[:, j, j],
+                        H_perm[:, i, j],
+                    )
 
                 delta_i = result.error_i - E[:, :, i]
                 delta_j = result.error_j - E[:, :, j]
@@ -549,7 +620,7 @@ def update_P(
     C: torch.Tensor,
     cd_cycles: int,
     verbose: bool = True,
-    assignment_solver: Literal["cd", "pair"] = "pair",
+    assignment_solver: Literal["cd", "pair", "pair_k2"] = "pair",
 ):
     if assignment_solver == "cd":
         return update_P_cd(W, H, labels, C, cd_cycles=cd_cycles, verbose=verbose)
@@ -561,6 +632,17 @@ def update_P(
             C,
             cd_cycles=cd_cycles,
             verbose=verbose,
+            pair_solver="monotone",
+        )
+    if assignment_solver == "pair_k2":
+        return update_P_pair(
+            W,
+            H,
+            labels,
+            C,
+            cd_cycles=cd_cycles,
+            verbose=verbose,
+            pair_solver="k2",
         )
     raise ValueError(f"Unsupported assignment solver: {assignment_solver}")
 
@@ -652,7 +734,7 @@ def train_least_squares(
     H: np.ndarray, # Shape: (num_groups, input_dim, input_dim)
     num_iterations: int = 3,
     cd_cycles: int = 4,
-    assignment_solver: Literal["cd", "pair"] = "pair",
+    assignment_solver: Literal["cd", "pair", "pair_k2"] = "pair",
 ) -> Tuple[np.ndarray, np.ndarray]:
     device = torch.device("cuda")
 
@@ -753,7 +835,7 @@ def seed_layer(
     group_count: int,
     num_iterations: int = 3,
     cd_cycles: int = 4,
-    assignment_solver: Literal["cd", "pair"] = "pair",
+    assignment_solver: Literal["cd", "pair", "pair_k2"] = "pair",
 ) -> Tuple[List[List[np.ndarray]], List[np.ndarray]]:
     lut_by_bit_by_module = []
     parent_weights_by_modules = []
@@ -930,7 +1012,7 @@ def seed(
     cpu_count: int = None,
     num_iterations: int = 3,
     cd_cycles: int = 4,
-    assignment_solver: Literal["cd", "pair"] = "pair",
+    assignment_solver: Literal["cd", "pair", "pair_k2"] = "pair",
     sub_qlayer: Tuple[int, int] = None,
 ):
     group_count = 1

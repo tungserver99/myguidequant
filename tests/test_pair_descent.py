@@ -197,3 +197,16 @@ def test_pair_production_path_uses_monotone_not_bruteforce_oracle(monkeypatch):
     pair_labels = update_P_pair(W, H, labels, C, cd_cycles=1, verbose=False)
 
     assert torch.equal(pair_labels.cpu(), torch.tensor([[0, 0]]))
+
+
+
+def test_update_p_dispatcher_pair_k2_uses_exact_pair_solution():
+    dtype = torch.float64
+    W = torch.tensor([[-3.0, -3.0]], dtype=dtype)
+    C = torch.tensor([[-2.0, -1.0]], dtype=dtype)
+    labels = torch.tensor([[1, 1]])
+    H = torch.tensor([[[1.0, -0.95], [-0.95, 1.0]]], dtype=dtype)
+
+    pair_k2_labels = update_P(W, H, labels, C, cd_cycles=1, verbose=False, assignment_solver="pair_k2")
+
+    assert torch.equal(pair_k2_labels.cpu(), torch.tensor([[0, 0]]))
