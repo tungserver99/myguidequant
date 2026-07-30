@@ -35,6 +35,10 @@ if __name__ == "__main__":
                         help="Number of iterations to run")
     parser.add_argument('--cd_cycles', type=int, default=4,
                         help='Number of CD cycles to run')
+    parser.add_argument('--assignment_solver', choices=['cd', 'pair'], default='pair',
+                        help='Assignment solver to use; pair is the default on this branch')
+    parser.add_argument('--pair_backend', choices=['bruteforce'], default='bruteforce',
+                        help='Exact pair solver backend')
     parser.add_argument("--sub_qlayer", nargs='+', type=int, default=None,
                         help="(start, end) of layers to use for quantization")
     parser.add_argument("--is_nosal", type=str2bool, default=False,

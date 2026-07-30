@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from any_precision.analyzer.analyzer import ModelAnalyzer
-from typing import List, Tuple, Literal, Optional
+from typing import List, Tuple, Literal, Optional, NamedTuple
 import time
 
 from .utils import get_progress_bar
@@ -49,7 +49,113 @@ def objective_function(
 
     return total_error
 
-def update_P(
+
+class PairSolveResult(NamedTuple):
+    label_i: torch.Tensor
+    label_j: torch.Tensor
+    error_i: torch.Tensor
+    error_j: torch.Tensor
+    cost: torch.Tensor
+
+
+def build_normalized_curvature(H: torch.Tensor) -> torch.Tensor:
+    assert H.ndim == 3
+    assert H.shape[1] == H.shape[2]
+    diag = torch.diagonal(H, dim1=-2, dim2=-1)
+    assert torch.all(diag > 0)
+    tiny = torch.finfo(H.dtype).tiny
+    denom = torch.sqrt(torch.clamp(diag.unsqueeze(-1) * diag.unsqueeze(-2), min=tiny))
+    rho = torch.abs(H) / denom
+    rho = rho.mean(dim=0)
+    rho.fill_diagonal_(float("-inf"))
+    return rho
+
+
+def build_greedy_pair_matching(H: torch.Tensor):
+    rho = build_normalized_curvature(H).detach().cpu()
+    d = rho.shape[0]
+    best_per_node = rho.max(dim=1).values
+    node_order = sorted(range(d), key=lambda i: (-float(best_per_node[i]), i))
+
+    used = [False] * d
+    pairs = []
+    singleton = None
+    for i in node_order:
+        if used[i]:
+            continue
+        best_j = None
+        best_val = None
+        for j in range(d):
+            if i == j or used[j]:
+                continue
+            val = float(rho[i, j])
+            if best_j is None or val > best_val or (val == best_val and j < best_j):
+                best_j = j
+                best_val = val
+        if best_j is None:
+            singleton = i
+            used[i] = True
+            continue
+        pairs.append((i, best_j))
+        used[i] = True
+        used[best_j] = True
+
+    if singleton is None:
+        remaining = [i for i, flag in enumerate(used) if not flag]
+        if remaining:
+            singleton = remaining[0]
+    return pairs, singleton
+
+
+def build_pair_permutation(pairs, singleton, D: int):
+    perm_list = [idx for pair in pairs for idx in pair]
+    if singleton is not None:
+        perm_list.append(singleton)
+    assert sorted(perm_list) == list(range(D))
+    perm = torch.tensor(perm_list, dtype=torch.long)
+    inv_perm = torch.argsort(perm)
+    return perm, inv_perm
+
+
+def solve_pair_bruteforce(
+    W_i: torch.Tensor,
+    W_j: torch.Tensor,
+    C_grp: torch.Tensor,
+    e_i_current: torch.Tensor,
+    e_j_current: torch.Tensor,
+    z_i: torch.Tensor,
+    z_j: torch.Tensor,
+    H_ii: torch.Tensor,
+    H_jj: torch.Tensor,
+    H_ij: torch.Tensor,
+) -> PairSolveResult:
+    K = C_grp.shape[-1]
+    h_shape = (H_ii.shape[0],) + (1,) * (C_grp.ndim - 1)
+    H_ii_v = H_ii.view(h_shape)
+    H_jj_v = H_jj.view(h_shape)
+    H_ij_v = H_ij.view(h_shape)
+
+    s_i = z_i - H_ii.view(-1, 1) * e_i_current - H_ij.view(-1, 1) * e_j_current
+    s_j = z_j - H_ij.view(-1, 1) * e_i_current - H_jj.view(-1, 1) * e_j_current
+
+    E_i_cand = C_grp - W_i.unsqueeze(-1)
+    E_j_cand = C_grp - W_j.unsqueeze(-1)
+    pair_cost = (
+        0.5 * H_ii_v.unsqueeze(-1) * E_i_cand.unsqueeze(-1).square()
+        + 0.5 * H_jj_v.unsqueeze(-2) * E_j_cand.unsqueeze(-2).square()
+        + H_ij_v.unsqueeze(-1) * E_i_cand.unsqueeze(-1) * E_j_cand.unsqueeze(-2)
+        + s_i.unsqueeze(-1).unsqueeze(-1) * E_i_cand.unsqueeze(-1)
+        + s_j.unsqueeze(-1).unsqueeze(-2) * E_j_cand.unsqueeze(-2)
+    )
+    min_cost, flat_index = pair_cost.flatten(-2).min(dim=-1)
+    label_i = flat_index // K
+    label_j = flat_index % K
+    error_i = torch.gather(E_i_cand, dim=-1, index=label_i.unsqueeze(-1)).squeeze(-1)
+    error_j = torch.gather(E_j_cand, dim=-1, index=label_j.unsqueeze(-1)).squeeze(-1)
+    return PairSolveResult(label_i, label_j, error_i, error_j, min_cost)
+
+
+def update_P_cd(
     W: torch.Tensor,  # Shape: (output_dim, input_dim)
     H: torch.Tensor,  # Shape: (num_groups, input_dim, input_dim)
     labels: torch.Tensor,  # Shape: (output_dim, input_dim)
@@ -57,8 +163,9 @@ def update_P(
     cd_cycles: int,
     verbose: bool = True,
 ):
-    device = torch.device("cuda")
+    device = W.device
     C = C.to(device)
+    H = H.to(device)
     assignments_prev = labels.to(device).long()  # Shape: (output_dim, input_dim)
     b, d = assignments_prev.shape
     n_cluster = C.size(1)
@@ -75,7 +182,7 @@ def update_P(
 
     assert W.shape[0] % num_groups == 0
 
-    pb = get_progress_bar(update_size, f"Updating P inside")
+    pb = get_progress_bar(update_size, f"Updating P inside") if verbose else None
 
     W_grp = W.reshape(num_groups, group_size, W.shape[-1]) # Shape: (num_groups, group_size, input_dim)
     C_grp = C.reshape(num_groups, group_size, C.shape[-1]) # Shape: (num_groups, group_size, n_cluster)
@@ -113,10 +220,12 @@ def update_P(
 
                 if update_idx < end_idx - 1:
                     B_grp[:, :, update_idx + 1:end_idx] += torch.bmm(W_hat_grp[:, :, index] - W_grp[:, :, index], H_grp[:, index, update_idx + 1:end_idx])
-                pb.update(1)
+                if pb is not None:
+                    pb.update(1)
             
             B_grp[:, :, end_idx:] += torch.bmm(W_hat_grp[:, :, start_idx:end_idx] - W_grp[:, :, start_idx:end_idx], H_grp[:, start_idx:end_idx, end_idx:])
-    pb.close()
+    if pb is not None:
+        pb.close()
     
     num_changed = (assignments_prev != assignments).sum().item()
     total_assignments = assignments_prev.numel()
@@ -125,6 +234,180 @@ def update_P(
         logging.info(f"Percentage of assignments changed: {percentage_changed:.2f}%")
 
     return assignments
+
+
+@torch.no_grad()
+def update_P_pair(
+    W: torch.Tensor,
+    H: torch.Tensor,
+    labels: torch.Tensor,
+    C: torch.Tensor,
+    cd_cycles: int,
+    verbose: bool = True,
+    pair_backend: Literal["bruteforce"] = "bruteforce",
+):
+    if pair_backend != "bruteforce":
+        raise ValueError(f"Unsupported pair backend: {pair_backend}")
+
+    device = W.device
+    W = W.to(device)
+    H = H.to(device)
+    C = C.to(device)
+    assignments_prev = labels.to(device).long()
+    assignments = assignments_prev.clone()
+
+    assert H.ndim == 3
+    assert H.shape[1] == H.shape[2]
+    assert W.shape[1] == H.shape[1]
+    assert W.shape[0] % H.shape[0] == 0
+    diag = torch.diagonal(H, dim1=-2, dim2=-1)
+    assert torch.all(diag > 0)
+
+    num_groups = H.shape[0]
+    group_size = W.shape[0] // num_groups
+    d = W.shape[1]
+    pairs, singleton = build_greedy_pair_matching(H)
+    perm_cpu, inv_perm_cpu = build_pair_permutation(pairs, singleton, d)
+    perm = perm_cpu.to(device)
+    inv_perm = inv_perm_cpu.to(device)
+
+    W_perm = W[:, perm]
+    H_perm = H.index_select(1, perm).index_select(2, perm)
+    assignments_perm = assignments[:, perm].contiguous()
+
+    W_grp = W_perm.reshape(num_groups, group_size, d)
+    C_grp = C.reshape(num_groups, group_size, C.shape[-1])
+    assignments_grp = assignments_perm.reshape(num_groups, group_size, d)
+    E = torch.gather(C_grp, dim=-1, index=assignments_grp.long()).reshape(num_groups, group_size, d) - W_grp
+
+    pair_coord_count = len(pairs) * 2
+    panel_coord_size = 128
+    if panel_coord_size % 2 != 0:
+        raise ValueError("pair panel coordinate size must be even")
+
+    update_size = cd_cycles * (len(pairs) + (1 if singleton is not None else 0))
+    pb = get_progress_bar(update_size, "Updating P pair") if verbose else None
+    changed_pairs = 0
+
+    for _ in range(cd_cycles):
+        Z = torch.bmm(E, H_perm)
+
+        for panel_start in range(0, pair_coord_count, panel_coord_size):
+            panel_end = min(panel_start + panel_coord_size, pair_coord_count)
+            if (panel_end - panel_start) % 2 != 0:
+                panel_end -= 1
+            if panel_end <= panel_start:
+                continue
+
+            delta_panel = torch.zeros(
+                num_groups,
+                group_size,
+                panel_end - panel_start,
+                dtype=E.dtype,
+                device=device,
+            )
+
+            for i in range(panel_start, panel_end, 2):
+                j = i + 1
+                old_label_i = assignments_grp[:, :, i].clone()
+                old_label_j = assignments_grp[:, :, j].clone()
+                result = solve_pair_bruteforce(
+                    W_grp[:, :, i],
+                    W_grp[:, :, j],
+                    C_grp,
+                    E[:, :, i],
+                    E[:, :, j],
+                    Z[:, :, i],
+                    Z[:, :, j],
+                    H_perm[:, i, i],
+                    H_perm[:, j, j],
+                    H_perm[:, i, j],
+                )
+
+                delta_i = result.error_i - E[:, :, i]
+                delta_j = result.error_j - E[:, :, j]
+                assignments_grp[:, :, i] = result.label_i
+                assignments_grp[:, :, j] = result.label_j
+                E[:, :, i] = result.error_i
+                E[:, :, j] = result.error_j
+                delta_panel[:, :, i - panel_start] = delta_i
+                delta_panel[:, :, j - panel_start] = delta_j
+
+                changed_pairs += torch.logical_or(
+                    old_label_i != result.label_i,
+                    old_label_j != result.label_j,
+                ).sum().item()
+
+                if j + 1 < panel_end:
+                    future = slice(j + 1, panel_end)
+                    Z[:, :, future] += (
+                        delta_i.unsqueeze(-1) * H_perm[:, i, future].unsqueeze(1)
+                        + delta_j.unsqueeze(-1) * H_perm[:, j, future].unsqueeze(1)
+                    )
+                if pb is not None:
+                    pb.update(1)
+
+            if panel_end < d:
+                Z[:, :, panel_end:] += torch.bmm(
+                    delta_panel,
+                    H_perm[:, panel_start:panel_end, panel_end:],
+                )
+
+        if singleton is not None:
+            i = pair_coord_count
+            H_ii = H_perm[:, i, i]
+            external = Z[:, :, i] - H_ii.view(-1, 1) * E[:, :, i]
+            target = -external / H_ii.view(-1, 1)
+            candidates = C_grp - W_grp[:, :, i].unsqueeze(-1)
+            labels_i = torch.abs(candidates - target.unsqueeze(-1)).min(dim=-1).indices
+            E[:, :, i] = torch.gather(candidates, dim=-1, index=labels_i.unsqueeze(-1)).squeeze(-1)
+            assignments_grp[:, :, i] = labels_i
+            if pb is not None:
+                pb.update(1)
+
+    if pb is not None:
+        pb.close()
+
+    assignments = assignments_grp.reshape(W.shape[0], d)[:, inv_perm].contiguous()
+    num_changed = (assignments_prev != assignments).sum().item()
+    total_assignments = assignments_prev.numel()
+    percentage_changed = num_changed / total_assignments * 100
+    if verbose:
+        logging.info("assignment solver: pair")
+        logging.info(f"pair backend: {pair_backend}")
+        logging.info(f"number of pairs: {len(pairs)}")
+        if singleton is not None:
+            logging.info(f"singleton coordinate: {singleton}")
+        logging.info(f"Percentage of assignments changed: {percentage_changed:.2f}%")
+        if len(pairs) > 0:
+            total_pairs = len(pairs) * num_groups * group_size * cd_cycles
+            logging.info(f"Percentage of pairs changed: {changed_pairs / total_pairs * 100:.2f}%")
+    return assignments
+
+
+def update_P(
+    W: torch.Tensor,
+    H: torch.Tensor,
+    labels: torch.Tensor,
+    C: torch.Tensor,
+    cd_cycles: int,
+    verbose: bool = True,
+    assignment_solver: Literal["cd", "pair"] = "pair",
+    pair_backend: Literal["bruteforce"] = "bruteforce",
+):
+    if assignment_solver == "cd":
+        return update_P_cd(W, H, labels, C, cd_cycles=cd_cycles, verbose=verbose)
+    if assignment_solver == "pair":
+        return update_P_pair(
+            W,
+            H,
+            labels,
+            C,
+            cd_cycles=cd_cycles,
+            verbose=verbose,
+            pair_backend=pair_backend,
+        )
+    raise ValueError(f"Unsupported assignment solver: {assignment_solver}")
 
 def update_C(
     W: torch.Tensor, # Shape: (output_dim, input_dim)
@@ -214,6 +497,8 @@ def train_least_squares(
     H: np.ndarray, # Shape: (num_groups, input_dim, input_dim)
     num_iterations: int = 3,
     cd_cycles: int = 4,
+    assignment_solver: Literal["cd", "pair"] = "pair",
+    pair_backend: Literal["bruteforce"] = "bruteforce",
 ) -> Tuple[np.ndarray, np.ndarray]:
     device = torch.device("cuda")
 
@@ -253,7 +538,15 @@ def train_least_squares(
 
         ######### Update P #########
         if iteration > 0:
-            labels = update_P(W, H, labels, C, cd_cycles=cd_cycles)
+            labels = update_P(
+                W,
+                H,
+                labels,
+                C,
+                cd_cycles=cd_cycles,
+                assignment_solver=assignment_solver,
+                pair_backend=pair_backend,
+            )
 
         # Compute objective value for logging
         obj_value = objective_function(W, H, labels, C).item()
@@ -307,6 +600,8 @@ def seed_layer(
     group_count: int,
     num_iterations: int = 3,
     cd_cycles: int = 4,
+    assignment_solver: Literal["cd", "pair"] = "pair",
+    pair_backend: Literal["bruteforce"] = "bruteforce",
 ) -> Tuple[List[List[np.ndarray]], List[np.ndarray]]:
     lut_by_bit_by_module = []
     parent_weights_by_modules = []
@@ -338,7 +633,16 @@ def seed_layer(
         init_centroids = module_init_centroids.reshape(output_dim, n_cluster) # Shape: (output_dim, n_cluster)
         reshaped_module_weight = module_weight.reshape(output_dim, input_dim) # Shape: (output_dim, input_dim)
 
-        labels, C, log_dict = train_least_squares(reshaped_module_weight, init_labels, init_centroids, module_hessian, num_iterations=num_iterations, cd_cycles=cd_cycles)
+        labels, C, log_dict = train_least_squares(
+            reshaped_module_weight,
+            init_labels,
+            init_centroids,
+            module_hessian,
+            num_iterations=num_iterations,
+            cd_cycles=cd_cycles,
+            assignment_solver=assignment_solver,
+            pair_backend=pair_backend,
+        )
 
         labels = labels.astype(np.uint8) # Shape: (output_dim, input_dim)
         labels = labels.reshape(output_dim, 1, input_dim) # Shape: (output_dim, 1, input_dim)
@@ -475,6 +779,8 @@ def seed(
     cpu_count: int = None,
     num_iterations: int = 3,
     cd_cycles: int = 4,
+    assignment_solver: Literal["cd", "pair"] = "pair",
+    pair_backend: Literal["bruteforce"] = "bruteforce",
     sub_qlayer: Tuple[int, int] = None,
 ):
     group_count = 1
@@ -544,6 +850,8 @@ def seed(
                     group_count,
                     num_iterations=num_iterations,
                     cd_cycles=cd_cycles,
+                    assignment_solver=assignment_solver,
+                    pair_backend=pair_backend,
                 )
 
                 io_executor.submit(
@@ -568,6 +876,8 @@ def seed(
                 group_count,
                 num_iterations=num_iterations,
                 cd_cycles=cd_cycles,
+                assignment_solver=assignment_solver,
+                pair_backend=pair_backend,
             )
 
             layer_saver(luts_by_bit_by_module, parent_weights, log_dict, l)
