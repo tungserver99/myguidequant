@@ -6,7 +6,7 @@ set -x
 # followed by standalone perplexity evaluation.
 #
 # This script intentionally uses a separate default CACHE_DIR and result tag so
-# pair-monotone results do not mix with scalar-CD or older double-CD outputs.
+# pair-monotone Triton results do not mix with scalar-CD or older double-CD outputs.
 #
 # Override with environment variables if needed:
 #   MODEL_NAME, MODEL_TAG, BITS, NUM_GROUPS, MODE, CACHE_DIR, EVAL_CACHE_DIR,
@@ -28,13 +28,13 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-3}"
 CD_CYCLES="${CD_CYCLES:-4}"
 RANDOM_STATE="${RANDOM_STATE:-42}"
 OVERWRITE="${OVERWRITE:-0}"
-CACHE_DIR="${CACHE_DIR:-cache_pair_monotone}"
+CACHE_DIR="${CACHE_DIR:-cache_pair_monotone_triton}"
 EVAL_CACHE_DIR="${EVAL_CACHE_DIR:-dataset_cache}"
 EVAL_METHOD="${EVAL_METHOD:-block}"
 EVAL_STRIDE="${EVAL_STRIDE:-512}"
 EVAL_DTYPE="${EVAL_DTYPE:-fp16}"
 ASSIGNMENT_SOLVER="pair"
-RESULT_SUFFIX="pair_monotone"
+RESULT_SUFFIX="pair_monotone_triton"
 
 # Colab often renders carriage-return progress updates as new lines.
 # Keep tqdm enabled, but refresh less often so logs stay readable.
@@ -47,6 +47,7 @@ MODEL_TAG="${MODEL_TAG:-${MODEL_BASENAME//[^[:alnum:]]/_}}"
 PACKED_MODEL_DIR="${CACHE_DIR}/layerwise_packed/layerwise-${MODEL_BASENAME}-w${BITS}-${DATASET}_s${NUM_EXAMPLES}_blk${SEQ_LEN}_g${NUM_GROUPS}_iter${NUM_ITERATIONS}_cd${CD_CYCLES}"
 PPL_JSON="${PACKED_MODEL_DIR}/ppl_${EVAL_METHOD}_${RESULT_SUFFIX}.json"
 PPL_TAG="${MODEL_TAG}_guidedquant_${RESULT_SUFFIX}_${BITS}bit_${DATASET}_${NUM_EXAMPLES}_${SEQ_LEN}_g${NUM_GROUPS}_iter${NUM_ITERATIONS}_cd${CD_CYCLES}_${EVAL_METHOD}"
+QUANT_LOG_DIR="logs_layer"
 
 quantize_overwrite_args=()
 layerwise_overwrite_args=()
@@ -80,6 +81,18 @@ python layerwise_nuq.py "${MODEL_NAME}" \
   --cache_dir "${CACHE_DIR}" \
   --random_state "${RANDOM_STATE}" \
   "${layerwise_overwrite_args[@]}"
+
+latest_quant_log="$(ls -t "${QUANT_LOG_DIR}"/*.txt 2>/dev/null | head -n 1 || true)"
+if [[ -n "${latest_quant_log}" ]]; then
+  echo "Latest quantization log: ${latest_quant_log}"
+  if ! grep -q "pair backend: triton-monotone-exact" "${latest_quant_log}"; then
+    echo "WARNING: Triton pair backend was not detected in the latest quantization log." >&2
+    echo "Expected: pair backend: triton-monotone-exact" >&2
+    echo "Check that this runtime has CUDA tensors and Triton installed." >&2
+  fi
+else
+  echo "WARNING: No quantization log found under ${QUANT_LOG_DIR}." >&2
+fi
 
 if [[ ! -d "${PACKED_MODEL_DIR}" ]]; then
   echo "Packed GuidedQuant pair-monotone model directory not found: ${PACKED_MODEL_DIR}" >&2
