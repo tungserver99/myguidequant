@@ -394,20 +394,39 @@ def update_P_pair(
     num_groups = H.shape[0]
     group_size = W.shape[0] // num_groups
     d = W.shape[1]
+
+    def _sync_if_cuda():
+        if W.is_cuda:
+            torch.cuda.synchronize(W.device)
+
+    def _log_step(name: str, start_time: float):
+        if verbose:
+            _sync_if_cuda()
+            logging.info(f"update_P_pair prepare {name}: {time.time() - start_time:.3f}s")
+
+    prepare_start = time.time()
     pairs, singleton = build_greedy_pair_matching(H)
+    _log_step("matching", prepare_start)
+
+    prepare_start = time.time()
     perm_cpu, inv_perm_cpu = build_pair_permutation(pairs, singleton, d)
     perm = perm_cpu.to(device)
     inv_perm = inv_perm_cpu.to(device)
+    _log_step("permutation indices", prepare_start)
 
+    prepare_start = time.time()
     W_perm = W[:, perm]
     H_perm = H.index_select(1, perm).index_select(2, perm)
     assignments_perm = assignments[:, perm].contiguous()
+    _log_step("materialize permuted tensors", prepare_start)
 
+    prepare_start = time.time()
     W_grp = W_perm.reshape(num_groups, group_size, d)
     C_grp = C.reshape(num_groups, group_size, C.shape[-1])
     assignments_grp = assignments_perm.reshape(num_groups, group_size, d)
     C_sorted, sorted_to_original = torch.sort(C_grp, dim=-1)
     E = torch.gather(C_grp, dim=-1, index=assignments_grp.long()).reshape(num_groups, group_size, d) - W_grp
+    _log_step("codebook sort and error init", prepare_start)
 
     pair_coord_count = len(pairs) * 2
     panel_coord_size = 128
@@ -418,8 +437,18 @@ def update_P_pair(
     pb = get_progress_bar(update_size, "Updating P pair") if verbose else None
     changed_pairs = torch.zeros((), dtype=torch.long, device=device)
 
-    for _ in range(cd_cycles):
+    pair_backend = "triton-monotone-exact" if triton_pair_available() and W.is_cuda else "torch-monotone-exact"
+    if verbose:
+        logging.info(f"assignment solver: pair")
+        logging.info(f"pair backend: {pair_backend}")
+        logging.info(f"number of pairs: {len(pairs)}")
+        if singleton is not None:
+            logging.info(f"singleton coordinate: {singleton}")
+
+    for cycle_idx in range(cd_cycles):
+        sweep_start = time.time()
         Z = torch.bmm(E, H_perm)
+        _log_step(f"cycle {cycle_idx + 1} Z=E@H", sweep_start)
 
         for panel_start in range(0, pair_coord_count, panel_coord_size):
             panel_end = min(panel_start + panel_coord_size, pair_coord_count)
@@ -506,12 +535,6 @@ def update_P_pair(
     total_assignments = assignments_prev.numel()
     percentage_changed = num_changed / total_assignments * 100
     if verbose:
-        logging.info("assignment solver: pair")
-        pair_backend = "triton-monotone-exact" if triton_pair_available() and W.is_cuda else "torch-monotone-exact"
-        logging.info(f"pair backend: {pair_backend}")
-        logging.info(f"number of pairs: {len(pairs)}")
-        if singleton is not None:
-            logging.info(f"singleton coordinate: {singleton}")
         logging.info(f"Percentage of assignments changed: {percentage_changed:.2f}%")
         if len(pairs) > 0:
             total_pairs = len(pairs) * num_groups * group_size * cd_cycles
