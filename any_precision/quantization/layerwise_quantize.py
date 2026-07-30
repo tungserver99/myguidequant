@@ -11,6 +11,14 @@ import time
 
 from .utils import get_progress_bar
 
+try:
+    from .pair_triton import solve_pair_monotone_triton, triton_pair_available
+except Exception:
+    solve_pair_monotone_triton = None
+
+    def triton_pair_available() -> bool:
+        return False
+
 @torch.no_grad()
 def objective_function(
     W: torch.Tensor, 
@@ -306,6 +314,60 @@ def solve_pair_monotone(
 
 
 
+def solve_pair_monotone_fast(
+    W_i: torch.Tensor,
+    W_j: torch.Tensor,
+    C_grp: torch.Tensor,
+    e_i_current: torch.Tensor,
+    e_j_current: torch.Tensor,
+    z_i: torch.Tensor,
+    z_j: torch.Tensor,
+    H_ii: torch.Tensor,
+    H_jj: torch.Tensor,
+    H_ij: torch.Tensor,
+    C_sorted: Optional[torch.Tensor] = None,
+    sorted_to_original: Optional[torch.Tensor] = None,
+) -> PairSolveResult:
+    if (
+        solve_pair_monotone_triton is not None
+        and triton_pair_available()
+        and W_i.is_cuda
+        and C_grp.dtype in (torch.float16, torch.float32)
+    ):
+        if C_sorted is None or sorted_to_original is None:
+            C_sorted, sorted_to_original = torch.sort(C_grp, dim=-1)
+        label_i, label_j, error_i, error_j, cost = solve_pair_monotone_triton(
+            W_i,
+            W_j,
+            C_sorted,
+            sorted_to_original,
+            e_i_current,
+            e_j_current,
+            z_i,
+            z_j,
+            H_ii,
+            H_jj,
+            H_ij,
+        )
+        return PairSolveResult(label_i, label_j, error_i, error_j, cost)
+
+    return solve_pair_monotone(
+        W_i,
+        W_j,
+        C_grp,
+        e_i_current,
+        e_j_current,
+        z_i,
+        z_j,
+        H_ii,
+        H_jj,
+        H_ij,
+        C_sorted=C_sorted,
+        sorted_to_original=sorted_to_original,
+    )
+
+
+
 @torch.no_grad()
 def update_P_pair(
     W: torch.Tensor,
@@ -379,7 +441,7 @@ def update_P_pair(
                 if verbose:
                     old_label_i = assignments_grp[:, :, i].clone()
                     old_label_j = assignments_grp[:, :, j].clone()
-                result = solve_pair_monotone(
+                result = solve_pair_monotone_fast(
                     W_grp[:, :, i],
                     W_grp[:, :, j],
                     C_grp,
@@ -445,7 +507,8 @@ def update_P_pair(
     percentage_changed = num_changed / total_assignments * 100
     if verbose:
         logging.info("assignment solver: pair")
-        logging.info("pair backend: monotone-exact")
+        pair_backend = "triton-monotone-exact" if triton_pair_available() and W.is_cuda else "torch-monotone-exact"
+        logging.info(f"pair backend: {pair_backend}")
         logging.info(f"number of pairs: {len(pairs)}")
         if singleton is not None:
             logging.info(f"singleton coordinate: {singleton}")
