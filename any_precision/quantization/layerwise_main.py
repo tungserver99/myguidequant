@@ -37,7 +37,6 @@ def layerwise_nuq(
         num_iterations=3,
         cd_cycles=4,
         assignment_solver="pair",
-        pair_backend="bruteforce",
         sub_qlayer=None,
         is_nosal=False,
 ):
@@ -180,7 +179,6 @@ def layerwise_nuq(
         num_iterations=num_iterations,
         cd_cycles=cd_cycles,
         assignment_solver=assignment_solver,
-        pair_backend=pair_backend,
         sub_qlayer=sub_qlayer,
     )
 

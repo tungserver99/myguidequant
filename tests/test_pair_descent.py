@@ -36,6 +36,7 @@ layerwise_quantize = _load_layerwise_quantize()
 build_greedy_pair_matching = layerwise_quantize.build_greedy_pair_matching
 build_pair_permutation = layerwise_quantize.build_pair_permutation
 solve_pair_bruteforce = layerwise_quantize.solve_pair_bruteforce
+solve_pair_monotone = layerwise_quantize.solve_pair_monotone
 update_P_cd = layerwise_quantize.update_P_cd
 update_P_pair = layerwise_quantize.update_P_pair
 update_P = layerwise_quantize.update_P
@@ -108,6 +109,34 @@ def test_bruteforce_pair_solver_selects_exact_minimum_for_unsorted_codebooks():
     assert torch.equal(result.label_j, expected % C_grp.shape[-1])
 
 
+
+def test_monotone_pair_solver_matches_bruteforce_minimum_energy_for_unsorted_codebooks():
+    dtype = torch.float64
+    C_grp = torch.tensor(
+        [
+            [[0.5, -1.0, 2.0, 0.25], [1.5, -0.5, 0.25, 2.5]],
+            [[-0.75, 0.1, 1.8, -1.4], [2.2, -1.1, 0.4, 1.0]],
+        ],
+        dtype=dtype,
+    )
+    W_i = torch.tensor([[0.2, -0.8], [1.1, -0.2]], dtype=dtype)
+    W_j = torch.tensor([[1.2, 0.4], [-0.1, 0.7]], dtype=dtype)
+    e_i = torch.tensor([[0.3, 0.2], [-0.6, 1.2]], dtype=dtype)
+    e_j = torch.tensor([[0.3, -0.15], [0.4, -0.8]], dtype=dtype)
+    z_i = torch.tensor([[0.7, -0.2], [1.3, 0.9]], dtype=dtype)
+    z_j = torch.tensor([[0.1, 0.5], [-0.4, 1.1]], dtype=dtype)
+    H_ii = torch.tensor([4.0, 2.5], dtype=dtype)
+    H_jj = torch.tensor([3.0, 5.0], dtype=dtype)
+    H_ij = torch.tensor([-1.2, 0.7], dtype=dtype)
+
+    brute = solve_pair_bruteforce(W_i, W_j, C_grp, e_i, e_j, z_i, z_j, H_ii, H_jj, H_ij)
+    monotone = solve_pair_monotone(W_i, W_j, C_grp, e_i, e_j, z_i, z_j, H_ii, H_jj, H_ij)
+
+    torch.testing.assert_close(monotone.cost, brute.cost, rtol=0, atol=64 * torch.finfo(dtype).eps)
+    torch.testing.assert_close(monotone.error_i, brute.error_i, rtol=0, atol=64 * torch.finfo(dtype).eps)
+    torch.testing.assert_close(monotone.error_j, brute.error_j, rtol=0, atol=64 * torch.finfo(dtype).eps)
+
+
 def test_pair_sweep_does_not_increase_original_objective():
     dtype = torch.float64
     W = torch.tensor([[0.2, -0.7, 1.4, -1.2], [1.0, 0.3, -0.4, 0.8]], dtype=dtype)
@@ -150,3 +179,21 @@ def test_update_p_dispatcher_defaults_to_pair_and_preserves_cd_baseline():
 
     assert torch.equal(default_labels.cpu(), torch.tensor([[0, 0]]))
     assert torch.equal(cd_labels.cpu(), labels)
+
+
+
+def test_pair_production_path_uses_monotone_not_bruteforce_oracle(monkeypatch):
+    dtype = torch.float64
+    W = torch.tensor([[-3.0, -3.0]], dtype=dtype)
+    C = torch.tensor([[-2.0, -1.0]], dtype=dtype)
+    labels = torch.tensor([[1, 1]])
+    H = torch.tensor([[[1.0, -0.95], [-0.95, 1.0]]], dtype=dtype)
+
+    def fail_bruteforce(*args, **kwargs):
+        raise AssertionError("bruteforce oracle must not be used by production pair path")
+
+    monkeypatch.setattr(layerwise_quantize, "solve_pair_bruteforce", fail_bruteforce)
+
+    pair_labels = update_P_pair(W, H, labels, C, cd_cycles=1, verbose=False)
+
+    assert torch.equal(pair_labels.cpu(), torch.tensor([[0, 0]]))

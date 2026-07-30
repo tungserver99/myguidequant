@@ -236,6 +236,75 @@ def update_P_cd(
     return assignments
 
 
+def solve_pair_monotone(
+    W_i: torch.Tensor,
+    W_j: torch.Tensor,
+    C_grp: torch.Tensor,
+    e_i_current: torch.Tensor,
+    e_j_current: torch.Tensor,
+    z_i: torch.Tensor,
+    z_j: torch.Tensor,
+    H_ii: torch.Tensor,
+    H_jj: torch.Tensor,
+    H_ij: torch.Tensor,
+) -> PairSolveResult:
+    K = C_grp.shape[-1]
+    G, R = W_i.shape
+    C_sorted, sorted_to_original = torch.sort(C_grp, dim=-1)
+    E_i_sorted = C_sorted - W_i.unsqueeze(-1)
+    E_j_sorted = C_sorted - W_j.unsqueeze(-1)
+
+    s_i = z_i - H_ii.view(-1, 1) * e_i_current - H_ij.view(-1, 1) * e_j_current
+    s_j = z_j - H_ij.view(-1, 1) * e_i_current - H_jj.view(-1, 1) * e_j_current
+
+    ptr_i = torch.zeros((G, R), dtype=torch.long, device=C_grp.device)
+    best_cost = torch.full((G, R), float("inf"), dtype=C_grp.dtype, device=C_grp.device)
+    best_label_i = torch.zeros((G, R), dtype=torch.long, device=C_grp.device)
+    best_label_j = torch.zeros((G, R), dtype=torch.long, device=C_grp.device)
+    best_error_i = torch.zeros((G, R), dtype=C_grp.dtype, device=C_grp.device)
+    best_error_j = torch.zeros((G, R), dtype=C_grp.dtype, device=C_grp.device)
+
+    scan_descending = H_ij > 0
+    for scan_pos in range(K):
+        j_sorted_idx_group = torch.where(
+            scan_descending,
+            torch.full((G,), K - 1 - scan_pos, dtype=torch.long, device=C_grp.device),
+            torch.full((G,), scan_pos, dtype=torch.long, device=C_grp.device),
+        )
+        j_sorted_idx = j_sorted_idx_group.view(G, 1).expand(G, R)
+        e_j = torch.gather(E_j_sorted, dim=-1, index=j_sorted_idx.unsqueeze(-1)).squeeze(-1)
+        target_i = -(s_i + H_ij.view(-1, 1) * e_j) / H_ii.view(-1, 1)
+
+        for _ in range(K - 1):
+            next_ptr = torch.clamp(ptr_i + 1, max=K - 1)
+            e_curr = torch.gather(E_i_sorted, dim=-1, index=ptr_i.unsqueeze(-1)).squeeze(-1)
+            e_next = torch.gather(E_i_sorted, dim=-1, index=next_ptr.unsqueeze(-1)).squeeze(-1)
+            advance = (ptr_i < K - 1) & (torch.abs(e_next - target_i) < torch.abs(e_curr - target_i))
+            if not bool(advance.any()):
+                break
+            ptr_i = ptr_i + advance.long()
+
+        e_i = torch.gather(E_i_sorted, dim=-1, index=ptr_i.unsqueeze(-1)).squeeze(-1)
+        label_i = torch.gather(sorted_to_original, dim=-1, index=ptr_i.unsqueeze(-1)).squeeze(-1)
+        label_j = torch.gather(sorted_to_original, dim=-1, index=j_sorted_idx.unsqueeze(-1)).squeeze(-1)
+        cost = (
+            0.5 * H_ii.view(-1, 1) * e_i.square()
+            + 0.5 * H_jj.view(-1, 1) * e_j.square()
+            + H_ij.view(-1, 1) * e_i * e_j
+            + s_i * e_i
+            + s_j * e_j
+        )
+        improve = cost < best_cost
+        best_cost = torch.where(improve, cost, best_cost)
+        best_label_i = torch.where(improve, label_i, best_label_i)
+        best_label_j = torch.where(improve, label_j, best_label_j)
+        best_error_i = torch.where(improve, e_i, best_error_i)
+        best_error_j = torch.where(improve, e_j, best_error_j)
+
+    return PairSolveResult(best_label_i, best_label_j, best_error_i, best_error_j, best_cost)
+
+
+
 @torch.no_grad()
 def update_P_pair(
     W: torch.Tensor,
@@ -244,11 +313,7 @@ def update_P_pair(
     C: torch.Tensor,
     cd_cycles: int,
     verbose: bool = True,
-    pair_backend: Literal["bruteforce"] = "bruteforce",
 ):
-    if pair_backend != "bruteforce":
-        raise ValueError(f"Unsupported pair backend: {pair_backend}")
-
     device = W.device
     W = W.to(device)
     H = H.to(device)
@@ -311,7 +376,7 @@ def update_P_pair(
                 j = i + 1
                 old_label_i = assignments_grp[:, :, i].clone()
                 old_label_j = assignments_grp[:, :, j].clone()
-                result = solve_pair_bruteforce(
+                result = solve_pair_monotone(
                     W_grp[:, :, i],
                     W_grp[:, :, j],
                     C_grp,
@@ -374,7 +439,7 @@ def update_P_pair(
     percentage_changed = num_changed / total_assignments * 100
     if verbose:
         logging.info("assignment solver: pair")
-        logging.info(f"pair backend: {pair_backend}")
+        logging.info("pair backend: monotone-exact")
         logging.info(f"number of pairs: {len(pairs)}")
         if singleton is not None:
             logging.info(f"singleton coordinate: {singleton}")
@@ -393,7 +458,6 @@ def update_P(
     cd_cycles: int,
     verbose: bool = True,
     assignment_solver: Literal["cd", "pair"] = "pair",
-    pair_backend: Literal["bruteforce"] = "bruteforce",
 ):
     if assignment_solver == "cd":
         return update_P_cd(W, H, labels, C, cd_cycles=cd_cycles, verbose=verbose)
@@ -405,7 +469,6 @@ def update_P(
             C,
             cd_cycles=cd_cycles,
             verbose=verbose,
-            pair_backend=pair_backend,
         )
     raise ValueError(f"Unsupported assignment solver: {assignment_solver}")
 
@@ -498,7 +561,6 @@ def train_least_squares(
     num_iterations: int = 3,
     cd_cycles: int = 4,
     assignment_solver: Literal["cd", "pair"] = "pair",
-    pair_backend: Literal["bruteforce"] = "bruteforce",
 ) -> Tuple[np.ndarray, np.ndarray]:
     device = torch.device("cuda")
 
@@ -545,7 +607,6 @@ def train_least_squares(
                 C,
                 cd_cycles=cd_cycles,
                 assignment_solver=assignment_solver,
-                pair_backend=pair_backend,
             )
 
         # Compute objective value for logging
@@ -601,7 +662,6 @@ def seed_layer(
     num_iterations: int = 3,
     cd_cycles: int = 4,
     assignment_solver: Literal["cd", "pair"] = "pair",
-    pair_backend: Literal["bruteforce"] = "bruteforce",
 ) -> Tuple[List[List[np.ndarray]], List[np.ndarray]]:
     lut_by_bit_by_module = []
     parent_weights_by_modules = []
@@ -641,7 +701,6 @@ def seed_layer(
             num_iterations=num_iterations,
             cd_cycles=cd_cycles,
             assignment_solver=assignment_solver,
-            pair_backend=pair_backend,
         )
 
         labels = labels.astype(np.uint8) # Shape: (output_dim, input_dim)
@@ -780,7 +839,6 @@ def seed(
     num_iterations: int = 3,
     cd_cycles: int = 4,
     assignment_solver: Literal["cd", "pair"] = "pair",
-    pair_backend: Literal["bruteforce"] = "bruteforce",
     sub_qlayer: Tuple[int, int] = None,
 ):
     group_count = 1
@@ -851,7 +909,6 @@ def seed(
                     num_iterations=num_iterations,
                     cd_cycles=cd_cycles,
                     assignment_solver=assignment_solver,
-                    pair_backend=pair_backend,
                 )
 
                 io_executor.submit(
@@ -877,7 +934,6 @@ def seed(
                 num_iterations=num_iterations,
                 cd_cycles=cd_cycles,
                 assignment_solver=assignment_solver,
-                pair_backend=pair_backend,
             )
 
             layer_saver(luts_by_bit_by_module, parent_weights, log_dict, l)

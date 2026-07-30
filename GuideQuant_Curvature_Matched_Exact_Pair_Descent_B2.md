@@ -22,11 +22,13 @@ The new assignment solver is an exact two-coordinate block coordinate descent me
 \boxed{\text{Curvature-Matched Exact Pair Descent}}
 \]
 
-The optional accelerated pair subsolver exploits the Monge/monotone structure and may be called:
+The production pair subsolver **must** exploit the Monge/monotone structure and is called:
 
 \[
-\boxed{\text{Monge-Accelerated Pair Descent}}.
+\boxed{\text{Monge-Accelerated Exact Pair Descent}}.
 \]
+
+The monotone solver is not an approximation. It must return the same minimum pair energy as exhaustive enumeration over all \(K^2\) pair assignments, while reducing the pair-search complexity to \(O(K)\).
 
 ---
 
@@ -90,7 +92,21 @@ else:
 
 The existing `cd_cycles` argument should remain the number of assignment sweeps. It may be reused for the pair solver to avoid changing existing scripts.
 
-## 1.3 Explicit non-goals
+## 1.3 Final production rule
+
+There is one production pair solver in this specification:
+
+\[
+\boxed{
+\texttt{solve\_pair\_monotone}
+}
+\]
+
+It must compute the exact same minimum pair energy as exhaustive \(K^2\) enumeration, while exploiting monotonicity to process only \(O(K)\) pair candidates.
+
+The exhaustive solver is a unit-test oracle only. `searchsorted` is optional debugging support only.
+
+## 1.4 Explicit non-goals
 
 Do **not**:
 
@@ -555,9 +571,9 @@ At the end of `update_P_pair`, inverse-permute the labels back to the original i
 
 ---
 
-# 9. Reference exact pair solver: vectorized \(K^2\)
+# 9. Brute-force exact pair oracle: vectorized \(K^2\)
 
-Implement this solver first. It is the correctness oracle for all optimized backends.
+Implement this solver only as a correctness oracle for tests and debugging. It must not be the production assignment backend.
 
 For one adjacent pair \((i,j)\), construct:
 
@@ -619,12 +635,14 @@ Update:
 - dequantized weights at \(i,j\);
 - errors at \(i,j\).
 
-This solver must:
+This oracle must:
 
 - contain no Python loop over output rows;
 - contain no Python loop over Hessian groups;
 - vectorize all \(K^2\) candidates;
-- produce exact results for arbitrary unsorted codebooks.
+- produce exact results for arbitrary unsorted codebooks;
+- be called only by tests, debug assertions, or small-problem validation;
+- never be selected as the normal GuideQuant production solver.
 
 Suggested function:
 
@@ -645,9 +663,9 @@ solve_pair_bruteforce(
 
 ---
 
-# 10. Monge/one-variable elimination
+# 10. Required production solver: exact Monge/monotone elimination
 
-After the brute-force solver is correct, add an exact accelerated backend.
+After the brute-force oracle is available, implement the production solver below. This solver is exact, not approximate.
 
 ## 10.1 Eliminate one coordinate
 
@@ -703,6 +721,39 @@ for:
 \]
 
 This reduces exact candidate evaluation from \(K^2\) to \(K\), assuming the nearest-codeword query is performed by the monotone scan.
+
+
+## 10.1.1 Exactness statement
+
+For every fixed label \(\ell\) of coordinate \(j\), the conditional objective in \(e_i\) is a strictly convex scalar quadratic because \(H_{ii}>0\). Its exact discrete minimizer over the finite codebook is therefore the codeword-error nearest to \(\bar e_i(\ell)\).
+
+The production solver evaluates this exact conditional minimizer for every \(\ell\in\{1,\ldots,K\}\), then chooses the lowest full pair energy. Hence:
+
+\[
+\boxed{
+\min_{\ell}
+\Phi\big(k^\star(\ell),\ell\big)
+=
+\min_{k,\ell}
+\Phi(k,\ell)
+}
+\]
+
+and therefore:
+
+\[
+\boxed{
+\text{monotone solver}
+\equiv
+\text{exhaustive }K^2\text{ solver}
+}
+\]
+
+with respect to the minimum energy.
+
+The monotone method only changes how the row minima are found. It does not remove feasible assignments, alter the objective, approximate the Hessian, or change the coupled-CD update.
+
+If several assignments have exactly the same minimum energy, different implementations may return different but equally optimal labels. Tests should compare minimum pair energy and dequantized values. When deterministic label equality is required, use the same lexicographic tie-breaking rule in both solvers.
 
 ## 10.2 Do not mutate the GuideQuant codebook
 
@@ -768,23 +819,38 @@ O(K)
 
 per output row/pair.
 
-## 10.4 Required implementation order
+## 10.4 Required implementation order and final backend
 
-Implement backends in this order:
+Use the following implementation order:
 
-1. `bruteforce`: exact \(K^2\), correctness oracle;
-2. `searchsorted`: exact one-variable elimination with batched temporary sorting;
-3. `monotone`: exact pointer scan, only after it matches brute force.
+1. Implement `solve_pair_bruteforce` as a test oracle.
+2. Implement `solve_pair_monotone` as the production solver.
+3. Verify the monotone solver against brute force on random and adversarial tests.
+4. Route every normal `assignment_solver="pair"` execution to `solve_pair_monotone`.
 
-`searchsorted` is allowed as an intermediate production backend. It is exact and GPU-friendly, although its formal cost is \(O(K\log K)\).
+A `searchsorted` helper may optionally be implemented to debug temporary codebook sorting and nearest-codeword queries. It is not required, must not be exposed as the final method, and must not replace the monotone production solver.
 
-The final `monotone` backend must be tested against brute force for random and adversarial cases.
+The implementation is not complete until:
 
-Do not use SMAWK unless profiling proves it necessary.
+\[
+\boxed{
+E_{\mathrm{monotone}}
+=
+E_{\mathrm{bruteforce}}
+}
+\]
 
-For the practical GuideQuant codebook sizes \(K\in\{4,8,16\}\), benchmark all exact backends. A tensorized \(K^2\) implementation may be faster than an irregular pointer kernel despite worse asymptotic complexity.
+for every test pair, up to floating-point assertion tolerance.
 
-The method must remain exact regardless of which backend is selected.
+Do not use SMAWK in this implementation. The required production algorithm is the direct monotone-pointer scan.
+
+Do not choose the production backend based on runtime. The production backend is fixed:
+
+```text
+pair assignment production backend = monotone exact O(K)
+```
+
+The brute-force \(K^2\) solver remains only a correctness oracle.
 
 ---
 
@@ -796,9 +862,11 @@ The following dimensions are independent and should be processed in parallel:
 
 - output rows within each Hessian group;
 - Hessian groups;
-- codeword candidates;
-- pair-cost candidates for the brute-force backend;
+- the \(K\) labels of the retained coordinate in the monotone pair solve;
+- temporary sorted-codebook operations;
 - module/layer I/O exactly as in GuideQuant.
+
+The \(K^2\) pair-cost tensor is used only by the test oracle, not by the production solver.
 
 Pairs themselves are **not independent**, because different pairs still interact through the full dense Hessian.
 
@@ -993,9 +1061,8 @@ build_normalized_curvature(H)
 build_greedy_pair_matching(H)
 build_pair_permutation(pairs, singleton, D)
 permute_pair_problem(W, H, labels)
-solve_pair_bruteforce(...)
-solve_pair_searchsorted(...)
-solve_pair_monotone(...)
+solve_pair_bruteforce(...)   # tests/debug only
+solve_pair_monotone(...)       # required production solver
 update_P_pair(...)
 ```
 
@@ -1083,15 +1150,17 @@ Retain:
 
 as the number of assignment sweeps for both solvers.
 
-An optional internal/debug argument may select:
+Do not expose a production backend selector. When:
 
-```python
---pair_backend {bruteforce,searchsorted,monotone}
+```text
+assignment_solver = pair
 ```
 
-but it should not affect the mathematical result.
+the implementation must always call the exact monotone \(O(K)\) solver.
 
-Do not add pairing thresholds, top-\(k\) values, penalties, or learning rates.
+The brute-force solver should be called directly only from tests or an explicitly enabled small-problem debug assertion.
+
+Do not add pairing thresholds, top-\(k\) values, penalties, learning rates, or a user-facing pair-backend option.
 
 ---
 
@@ -1205,11 +1274,16 @@ For random small tensors:
 verify that:
 
 ```text
-solve_pair_searchsorted == solve_pair_bruteforce
 solve_pair_monotone == solve_pair_bruteforce
 ```
 
-Compare selected quantized values and pair energy, not only raw label IDs when duplicate codebook values exist.
+The required equality is:
+
+- identical minimum pair energy within dtype-derived tolerance;
+- identical dequantized pair values when the minimizer is unique;
+- equally optimal values when exact ties exist.
+
+If an optional `searchsorted` debug helper is implemented, test it against the same brute-force oracle, but it is not part of the required production path.
 
 ## 15.2 Exact objective decrease
 
@@ -1322,14 +1396,16 @@ Profile separately:
 7. inverse permutation;
 8. unchanged exact codebook update.
 
-The following must be parallelized:
+The following must be parallelized in production:
 
 - all output rows;
 - all Hessian groups;
-- all codeword candidates;
-- all \(K^2\) candidates in the brute-force reference;
+- the retained-coordinate label dimension of size \(K\);
+- temporary sorted-codebook operations;
 - matrix propagation with `torch.bmm`;
 - existing layer/module I/O.
+
+The \(K^2\) candidate dimension belongs only to the brute-force test oracle.
 
 The following remains sequential to preserve exact Gauss-Seidel descent:
 
@@ -1349,9 +1425,11 @@ scalar decisions per sweep to:
 
 pair decisions per sweep.
 
-Do not claim a speedup before benchmarking. For small \(K\), the vectorized \(K^2\) backend may outperform the formal \(O(K)\) backend.
+Do not claim an end-to-end speedup before benchmarking.
 
-Select the production backend by measured GPU runtime, subject to exact equality with the brute-force oracle.
+Nevertheless, the method implemented by this specification is fixed: production pair search must use exact monotone elimination with \(O(K)\) candidate processing. The brute-force \(K^2\) oracle must not silently replace it, even if the oracle happens to be faster for a particular very small \(K\).
+
+Profile the monotone implementation and optimize its GPU organization without changing its exact result.
 
 ---
 
@@ -1363,7 +1441,7 @@ Add the following optional logs:
 
 ```text
 assignment solver: pair
-pair backend: brute-force/searchsorted/monotone
+pair backend: monotone-exact
 number of pairs
 singleton coordinate, if any
 matching construction time
@@ -1393,12 +1471,14 @@ The implementation is complete only when all conditions below hold:
 10. Non-pair Hessian interactions are included through the external fields.
 11. Output rows and Hessian groups are GPU-vectorized.
 12. Lazy panel propagation is equivalent to naive exact propagation.
-13. The optimized backend matches brute force.
-14. The original scalar-CD path remains available for ablation.
-15. No gradient term, \(r\), learning rate, penalty, or new optimization hyperparameter is introduced.
+13. The production monotone solver matches the brute-force minimum pair energy.
+14. The production pair path always uses monotone exact \(O(K)\) elimination.
+15. The brute-force \(K^2\) solver is restricted to tests/debugging.
+16. The original scalar-CD path remains available for ablation.
+17. No gradient term, \(r\), learning rate, penalty, or new optimization hyperparameter is introduced.
 
 ---
 
 # 19. One-sentence instruction to Codex
 
-> Keep the complete GuideQuant/LNQ pipeline, artifacts, Hessian collection, initialization, exact codebook update, outer alternating schedule, logging, and serialization unchanged; replace only the scalar `update_P` assignment solver with curvature-matched exact \(B=2\) pair coordinate descent using the full damped symmetric Hessian, a deterministic Hessian-based pair order, exact vectorized pair minimization, and GuideQuant-style lazy GPU panel propagation, while retaining the original scalar CD and a brute-force pair oracle for verification.
+> Keep the complete GuideQuant/LNQ pipeline, artifacts, Hessian collection, initialization, exact codebook update, outer alternating schedule, logging, and serialization unchanged; replace only scalar `update_P` with curvature-matched exact \(B=2\) pair coordinate descent using the full damped symmetric Hessian, deterministic Hessian-based pairing, exact monotone one-variable elimination that returns the same minimum as exhaustive \(K^2\) search in \(O(K)\), and GuideQuant-style lazy GPU panel propagation; retain scalar CD for ablation and retain exhaustive \(K^2\) pair search only as a unit-test oracle.
