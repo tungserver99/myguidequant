@@ -247,10 +247,13 @@ def solve_pair_monotone(
     H_ii: torch.Tensor,
     H_jj: torch.Tensor,
     H_ij: torch.Tensor,
+    C_sorted: Optional[torch.Tensor] = None,
+    sorted_to_original: Optional[torch.Tensor] = None,
 ) -> PairSolveResult:
     K = C_grp.shape[-1]
     G, R = W_i.shape
-    C_sorted, sorted_to_original = torch.sort(C_grp, dim=-1)
+    if C_sorted is None or sorted_to_original is None:
+        C_sorted, sorted_to_original = torch.sort(C_grp, dim=-1)
     E_i_sorted = C_sorted - W_i.unsqueeze(-1)
     E_j_sorted = C_sorted - W_j.unsqueeze(-1)
 
@@ -280,8 +283,6 @@ def solve_pair_monotone(
             e_curr = torch.gather(E_i_sorted, dim=-1, index=ptr_i.unsqueeze(-1)).squeeze(-1)
             e_next = torch.gather(E_i_sorted, dim=-1, index=next_ptr.unsqueeze(-1)).squeeze(-1)
             advance = (ptr_i < K - 1) & (torch.abs(e_next - target_i) < torch.abs(e_curr - target_i))
-            if not bool(advance.any()):
-                break
             ptr_i = ptr_i + advance.long()
 
         e_i = torch.gather(E_i_sorted, dim=-1, index=ptr_i.unsqueeze(-1)).squeeze(-1)
@@ -343,6 +344,7 @@ def update_P_pair(
     W_grp = W_perm.reshape(num_groups, group_size, d)
     C_grp = C.reshape(num_groups, group_size, C.shape[-1])
     assignments_grp = assignments_perm.reshape(num_groups, group_size, d)
+    C_sorted, sorted_to_original = torch.sort(C_grp, dim=-1)
     E = torch.gather(C_grp, dim=-1, index=assignments_grp.long()).reshape(num_groups, group_size, d) - W_grp
 
     pair_coord_count = len(pairs) * 2
@@ -352,7 +354,7 @@ def update_P_pair(
 
     update_size = cd_cycles * (len(pairs) + (1 if singleton is not None else 0))
     pb = get_progress_bar(update_size, "Updating P pair") if verbose else None
-    changed_pairs = 0
+    changed_pairs = torch.zeros((), dtype=torch.long, device=device)
 
     for _ in range(cd_cycles):
         Z = torch.bmm(E, H_perm)
@@ -374,8 +376,9 @@ def update_P_pair(
 
             for i in range(panel_start, panel_end, 2):
                 j = i + 1
-                old_label_i = assignments_grp[:, :, i].clone()
-                old_label_j = assignments_grp[:, :, j].clone()
+                if verbose:
+                    old_label_i = assignments_grp[:, :, i].clone()
+                    old_label_j = assignments_grp[:, :, j].clone()
                 result = solve_pair_monotone(
                     W_grp[:, :, i],
                     W_grp[:, :, j],
@@ -387,6 +390,8 @@ def update_P_pair(
                     H_perm[:, i, i],
                     H_perm[:, j, j],
                     H_perm[:, i, j],
+                    C_sorted=C_sorted,
+                    sorted_to_original=sorted_to_original,
                 )
 
                 delta_i = result.error_i - E[:, :, i]
@@ -398,10 +403,11 @@ def update_P_pair(
                 delta_panel[:, :, i - panel_start] = delta_i
                 delta_panel[:, :, j - panel_start] = delta_j
 
-                changed_pairs += torch.logical_or(
-                    old_label_i != result.label_i,
-                    old_label_j != result.label_j,
-                ).sum().item()
+                if verbose:
+                    changed_pairs += torch.logical_or(
+                        old_label_i != result.label_i,
+                        old_label_j != result.label_j,
+                    ).sum()
 
                 if j + 1 < panel_end:
                     future = slice(j + 1, panel_end)
@@ -446,7 +452,7 @@ def update_P_pair(
         logging.info(f"Percentage of assignments changed: {percentage_changed:.2f}%")
         if len(pairs) > 0:
             total_pairs = len(pairs) * num_groups * group_size * cd_cycles
-            logging.info(f"Percentage of pairs changed: {changed_pairs / total_pairs * 100:.2f}%")
+            logging.info(f"Percentage of pairs changed: {changed_pairs.item() / total_pairs * 100:.2f}%")
     return assignments
 
 
