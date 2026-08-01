@@ -6,7 +6,7 @@ import logging
 
 from .config import *
 from ..analyzer import get_analyzer
-from .activations import accumulate_saliency_weighted_hessians
+from .activations import accumulate_nll_hvp_hessians, accumulate_saliency_weighted_hessians
 from .layerwise_quantize import seed
 from .pack import pack
 from .datautils import get_tokens
@@ -37,6 +37,14 @@ def layerwise_nuq(
         num_iterations=3,
         cd_cycles=4,
         assignment_solver="pair",
+        hessian_source="saliency",
+        nll_hvp_probes=1,
+        nll_hvp_layer_chunk_size=0,
+        nll_hvp_profile=False,
+        nll_hvp_dtype="auto",
+        nll_hessian_builder="legacy",
+        nll_hessian_group_chunk_size=4,
+        nll_hessian_validate_shared_x=False,
         sub_qlayer=None,
         is_nosal=False,
 ):
@@ -57,18 +65,28 @@ def layerwise_nuq(
                           f"{model_name}"
                           f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}")
 
+    if hessian_source not in ("saliency", "nll_hvp"):
+        raise ValueError(f"Unsupported hessian_source={hessian_source!r}; expected 'saliency' or 'nll_hvp'")
+
+    hessian_suffix = "_nosal" if is_nosal else ""
+    if hessian_source == "nll_hvp":
+        hessian_suffix = f"_hnll_global_hvp_p{nll_hvp_probes}_lc{nll_hvp_layer_chunk_size}_dt{nll_hvp_dtype}"
+        if nll_hessian_builder != "legacy":
+            hessian_suffix += f"_hb{nll_hessian_builder}_gcs{nll_hessian_group_chunk_size}"
+        if nll_hvp_sdpa_backend != "math":
+            hessian_suffix += f"_sdpa{nll_hvp_sdpa_backend}"
+
     hessians_cache_path = (f"{cache_dir}/hessians/"
                           f"{model_name}"
-                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{'_nosal' if is_nosal else ''}")
+                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{hessian_suffix}")
 
     quantized_cache_path = (f"{cache_dir}/layerwise_quantized/"
                           f"{model_name}-w{seed_precision}"
-                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{'_nosal' if is_nosal else ''}")
+                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{hessian_suffix}")
 
     model_output_path = (f"{cache_dir}/layerwise_packed/"
                          f"layerwise-{model_name}-w{seed_precision}"
-                         f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{'_nosal' if is_nosal else ''}")
-
+                         f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{hessian_suffix}")
 
     # Logging with time sans date, level name, and message
     log_dir = "logs_layer"
@@ -92,6 +110,15 @@ def layerwise_nuq(
     logging.info(f"Hessians cache path: {hessians_cache_path}")
     logging.info(f"Quantized cache path: {quantized_cache_path}")
     logging.info(f"Model output path: {model_output_path}")
+    logging.info(f"Hessian source: {hessian_source}")
+    logging.info(f"NLL HVP probes: {nll_hvp_probes}")
+    logging.info(f"NLL HVP layer chunk size: {nll_hvp_layer_chunk_size}")
+    logging.info(f"NLL HVP profile: {nll_hvp_profile}")
+    logging.info(f"NLL HVP dtype: {nll_hvp_dtype}")
+    logging.info(f"NLL Hessian builder: {nll_hessian_builder}")
+    logging.info(f"NLL Hessian group chunk size: {nll_hessian_group_chunk_size}")
+    logging.info(f"NLL Hessian validate shared-X: {nll_hessian_validate_shared_x}")
+    logging.info(f"NLL HVP SDPA backend: {nll_hvp_sdpa_backend}")
 
     # ------------------- Log mode and other options -------------------
 
@@ -140,7 +167,19 @@ def layerwise_nuq(
     # ------------------- Get Hessians -------------------
     logging.info("------------------- Get Hessians -------------------")
     logging.info(f"Getting Hessians for {dataset} with sequence length {seq_len} and {num_examples} examples")
-    from_cache = accumulate_saliency_weighted_hessians(analyzer, tokens, saliency_cache_path, hessians_cache_path, num_groups)
+    if hessian_source == "nll_hvp":
+        from_cache = accumulate_nll_hvp_hessians(
+            analyzer, tokens, hessians_cache_path, num_groups,
+            num_probes=nll_hvp_probes, random_state=random_state,
+            layer_chunk_size=nll_hvp_layer_chunk_size,
+            profile=nll_hvp_profile,
+            curvature_dtype=nll_hvp_dtype,
+            hessian_builder=nll_hessian_builder,
+            hessian_group_chunk_size=nll_hessian_group_chunk_size,
+            validate_shared_x=nll_hessian_validate_shared_x,
+        )
+    else:
+        from_cache = accumulate_saliency_weighted_hessians(analyzer, tokens, saliency_cache_path, hessians_cache_path, num_groups)
     logging.info("Hessians loading complete.")
 
     if mode == 'hessians':
@@ -213,3 +252,10 @@ def layerwise_nuq(
     )
 
     logging.info("Packing complete.")
+
+
+
+
+
+
+

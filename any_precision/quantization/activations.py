@@ -3,12 +3,18 @@ import torch.nn as nn
 from tqdm.auto import trange
 import os
 import logging
+import math
+import time
 from .config import *
 from any_precision.analyzer.analyzer import ModelAnalyzer
 from typing import List, Tuple, Sequence, Dict
 from itertools import chain
 from tqdm import tqdm
-from transformers import Gemma3Config
+try:
+    from transformers import Gemma3Config
+except ImportError:
+    class Gemma3Config:
+        pass
 
 
 @torch.no_grad()
@@ -166,6 +172,7 @@ def update_outs_parallel(
 
 import os
 import logging
+import time
 import torch
 import torch.nn as nn
 from typing import Sequence, Dict, Any, Optional, Tuple, List
@@ -617,3 +624,500 @@ def _unwrap_sublayers(layer: nn.Module):
             child_name = name.split('.')[-1]
             parent_module = getattr(layer, parent_name)
             setattr(parent_module, child_name, submodule.wrapped_layer)
+
+
+
+def _prepare_hnll_tokens_and_labels(tokens: torch.Tensor, pad_token_id: Optional[int] = None):
+    if tokens.dim() == 1:
+        tokens = tokens.unsqueeze(0)
+
+    labels = tokens.clone()
+    attention_mask = None
+    if pad_token_id is not None:
+        pad_mask = labels.eq(pad_token_id)
+        if pad_mask.any():
+            labels = labels.masked_fill(pad_mask, -100)
+            attention_mask = (~pad_mask).long()
+
+    valid_tokens = int(labels[..., 1:].ne(-100).sum().item())
+    return tokens, labels, attention_mask, valid_tokens
+
+def _rademacher_like(tensor: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(tensor).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+
+
+def reduce_channels_by_group_mean(diag_sample: torch.Tensor, num_groups: int) -> torch.Tensor:
+    if diag_sample.shape[-1] % num_groups != 0:
+        raise ValueError(
+            f"output channels {diag_sample.shape[-1]} must be divisible by num_groups {num_groups}"
+        )
+    channels_per_group = diag_sample.shape[-1] // num_groups
+    return diag_sample.reshape(*diag_sample.shape[:-1], num_groups, channels_per_group).mean(dim=-1)
+
+
+
+def _resolve_hnll_curvature_dtype(dtype: str, device: torch.device, current_dtype: torch.dtype) -> torch.dtype:
+    if dtype == "auto":
+        if device.type == "cuda" and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return current_dtype
+    if dtype == "current":
+        return current_dtype
+    if dtype == "bf16":
+        if device.type == "cuda" and not torch.cuda.is_bf16_supported():
+            logging.warning("Requested HNLL BF16 curvature pass, but CUDA BF16 is not supported; using current dtype.")
+            return current_dtype
+        return torch.bfloat16
+    if dtype == "fp16":
+        return torch.float16
+    if dtype == "fp32":
+        return torch.float32
+    raise ValueError(f"Unsupported HNLL curvature dtype {dtype!r}; expected auto/current/bf16/fp16/fp32")
+
+def _cuda_sync_if_profiled(device: torch.device, enabled: bool):
+    if enabled and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _sdpa_backend_context(backend: str):
+    from contextlib import nullcontext
+    if backend == "auto" or not torch.cuda.is_available():
+        return nullcontext()
+
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        backend_map = {
+            "math": [SDPBackend.MATH],
+            "flash": [SDPBackend.FLASH_ATTENTION],
+            "efficient": [SDPBackend.EFFICIENT_ATTENTION],
+            "cudnn": [SDPBackend.CUDNN_ATTENTION],
+        }
+        return sdpa_kernel(backend_map[backend])
+    except Exception:
+        pass
+
+    if backend == "math":
+        try:
+            return torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_math=True,
+                enable_mem_efficient=False,
+            )
+        except Exception:
+            return nullcontext()
+
+    return nullcontext()
+
+
+def _sdpa_math_context():
+    return _sdpa_backend_context("math")
+
+
+def _validate_hessian_builder_inputs(x: torch.Tensor, stats: torch.Tensor):
+    if x.ndim != 2:
+        raise ValueError(f"x must have shape [tokens, input_dim], got {tuple(x.shape)}")
+    if stats.ndim != 2:
+        raise ValueError(f"stats must have shape [tokens, num_groups], got {tuple(stats.shape)}")
+    if x.shape[0] != stats.shape[0]:
+        raise ValueError(f"x tokens {x.shape[0]} must match stats tokens {stats.shape[0]}")
+    if not torch.isfinite(x).all():
+        raise ValueError("x contains non-finite values")
+    if not torch.isfinite(stats).all():
+        raise ValueError("stats contains non-finite values")
+    if (stats < 0).any():
+        raise ValueError("negative stats passed to Hessian builder; positive projection must happen upstream")
+
+
+def build_group_hessians_legacy(x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+    _validate_hessian_builder_inputs(x, stats)
+    x = x.float()
+    stats = stats.float()
+    hessians = []
+    for group_idx in range(stats.shape[1]):
+        sqrt_s = torch.sqrt(stats[:, group_idx]).unsqueeze(-1)
+        x_weighted = x * sqrt_s
+        hessian = x_weighted.T @ x_weighted
+        hessians.append(hessian)
+    hessians = torch.stack(hessians, dim=0)
+    return 0.5 * (hessians + hessians.transpose(-1, -2))
+
+
+def build_group_hessians_batched(x: torch.Tensor, stats: torch.Tensor, group_chunk_size: int) -> torch.Tensor:
+    _validate_hessian_builder_inputs(x, stats)
+    if group_chunk_size <= 0:
+        raise ValueError(f"group_chunk_size must be positive, got {group_chunk_size}")
+
+    x = x.float()
+    stats = stats.float()
+    chunks = []
+    for start in range(0, stats.shape[1], group_chunk_size):
+        end = min(start + group_chunk_size, stats.shape[1])
+        sqrt_s = torch.sqrt(stats[:, start:end]).transpose(0, 1)
+        x_weighted = sqrt_s.unsqueeze(-1) * x.unsqueeze(0)
+        h_chunk = torch.bmm(x_weighted.transpose(1, 2), x_weighted)
+        chunks.append(h_chunk)
+
+    hessians = torch.cat(chunks, dim=0)
+    return 0.5 * (hessians + hessians.transpose(-1, -2))
+
+
+def build_shared_x_group_hessians(x: torch.Tensor, module_group_stats, group_chunk_size: int):
+    if x.ndim != 2:
+        raise ValueError(f"x must have shape [tokens, input_dim], got {tuple(x.shape)}")
+    module_names = list(module_group_stats.keys())
+    group_counts = []
+    stats_list = []
+    for module_name in module_names:
+        stats = module_group_stats[module_name]
+        _validate_hessian_builder_inputs(x, stats)
+        group_counts.append(stats.shape[1])
+        stats_list.append(stats.float())
+
+    all_stats = torch.cat(stats_list, dim=1)
+    all_hessians = build_group_hessians_batched(x.float(), all_stats, group_chunk_size)
+    split_hessians = torch.split(all_hessians, group_counts, dim=0)
+    return {module_name: hessian for module_name, hessian in zip(module_names, split_hessians)}
+
+
+def build_group_hessians_from_curvature(x: torch.Tensor, s_group: torch.Tensor) -> torch.Tensor:
+    return build_group_hessians_batched(x, s_group, group_chunk_size=s_group.shape[1])
+
+
+def _shared_x_semantic_id(layer_idx: int, module_name: str):
+    if module_name.endswith("self_attn.q_proj") or module_name.endswith("self_attn.k_proj") or module_name.endswith("self_attn.v_proj"):
+        return (layer_idx, "attention_input")
+    if module_name.endswith("mlp.gate_proj") or module_name.endswith("mlp.up_proj"):
+        return (layer_idx, "mlp_input")
+    return (layer_idx, "module_input", module_name)
+
+
+def _build_hnll_sample_hessians(
+    module_keys,
+    xs,
+    group_accums,
+    num_probes: int,
+    builder: str,
+    group_chunk_size: int,
+    validate_shared_x: bool,
+):
+    if builder not in ("legacy", "batched", "batched_shared_x"):
+        raise ValueError(f"Unsupported nll_hessian_builder={builder!r}")
+    if builder in ("batched", "batched_shared_x") and group_chunk_size <= 0:
+        raise ValueError(f"nll_hessian_group_chunk_size must be positive for {builder}, got {group_chunk_size}")
+
+    x_by_key = {}
+    stats_by_key = {}
+    for key, x in zip(module_keys, xs):
+        raw_s = group_accums[key].div(float(num_probes))
+        s_pos = raw_s.clamp_min(0.0)
+        x_by_key[key] = x.detach().reshape(-1, x.shape[-1]).float()
+        stats_by_key[key] = s_pos
+
+    if builder == "legacy":
+        return {key: build_group_hessians_from_curvature(x_by_key[key], stats_by_key[key]) for key in module_keys}
+
+    if builder == "batched":
+        return {
+            key: build_group_hessians_batched(x_by_key[key], stats_by_key[key], group_chunk_size)
+            for key in module_keys
+        }
+
+    grouped_keys = {}
+    for key in module_keys:
+        layer_idx, module_name = key
+        shared_id = _shared_x_semantic_id(layer_idx, module_name)
+        grouped_keys.setdefault(shared_id, []).append(key)
+
+    hessians = {}
+    for shared_id, keys in grouped_keys.items():
+        base_x = x_by_key[keys[0]]
+        can_fuse = len(keys) > 1
+        if validate_shared_x and can_fuse:
+            for key in keys[1:]:
+                if base_x.shape != x_by_key[key].shape or not torch.equal(base_x, x_by_key[key]):
+                    logging.warning(f"HNLL shared-X validation failed for {shared_id}; falling back to per-module batched builder")
+                    can_fuse = False
+                    break
+
+        if not can_fuse:
+            for key in keys:
+                hessians[key] = build_group_hessians_batched(x_by_key[key], stats_by_key[key], group_chunk_size)
+            continue
+
+        module_group_stats = {key: stats_by_key[key] for key in keys}
+        hessians.update(build_shared_x_group_hessians(base_x, module_group_stats, group_chunk_size))
+
+    return hessians
+
+def _log_hnll_hessian_stats(layer_idx: int, module_name: str, hessian: torch.Tensor, num_probes: int, valid_tokens: int):
+    h = hessian.detach().float()
+    diag = torch.diagonal(h, dim1=-2, dim2=-1)
+    logging.info(
+        f"[HNLL][Layer {layer_idx}][{module_name}] valid_tokens={valid_tokens} probes={num_probes} "
+        f"H trace={diag.sum(dim=-1).mean().item():.6e} "
+        f"fro={torch.linalg.matrix_norm(h).mean().item():.6e} "
+        f"diag_min={diag.min().item():.6e} diag_max={diag.max().item():.6e}"
+    )
+
+
+def accumulate_nll_hvp_hessians(
+    analyzer,
+    data: List[torch.Tensor],
+    output_folder: str,
+    num_groups: int,
+    num_probes: int = 1,
+    random_state: Optional[int] = None,
+    layer_chunk_size: int = 0,
+    profile: bool = False,
+    curvature_dtype: str = "auto",
+    hessian_builder: str = "legacy",
+    hessian_group_chunk_size: int = 4,
+    validate_shared_x: bool = False,
+    sdpa_backend: str = "math",
+) -> bool:
+    """Accumulate Group-Trace Positive NLL Hessians via autograd HVP.
+
+    This writes the same per-layer cache format consumed by layerwise_quantize.seed:
+    output_folder/l{layer}.pt contains {module_name: H} with H shaped [G, D, D].
+    `layer_chunk_size=0` uses all target layers in one global HVP chunk. Positive values set a memory-fallback chunk size and amortize the
+    full-model forward over one or more target layers by using one joint Hutchinson
+    HVP per probe for the selected layers.
+    """
+    if num_probes < 1:
+        raise ValueError(f"num_probes must be >= 1, got {num_probes}")
+    if layer_chunk_size < 0:
+        raise ValueError(f"layer_chunk_size must be >= 0, got {layer_chunk_size}")
+
+    layers = analyzer.get_layers()
+    num_layers = len(layers)
+    if output_folder and os.path.exists(output_folder):
+        if all(os.path.exists(os.path.join(output_folder, f"l{i}.pt")) for i in range(num_layers)):
+            logging.info(f"Cached HNLL hessians found in {output_folder}")
+            return True
+
+    if random_state is not None:
+        torch.manual_seed(random_state)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(random_state)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.device_count() > 1:
+        logging.warning("HNLL HVP Hessian path uses a single device to avoid cross-device double-backward graphs.")
+
+    os.makedirs(output_folder, exist_ok=True)
+    model = analyzer.model
+    model.eval()
+    old_param = next(model.parameters())
+    old_dtype = old_param.dtype
+    hnll_dtype = _resolve_hnll_curvature_dtype(curvature_dtype, device, old_dtype)
+    logging.info(f"HNLL curvature dtype: {hnll_dtype} (requested={curvature_dtype}, original={old_dtype})")
+    model.to(device=device, dtype=hnll_dtype)
+
+    old_use_cache = getattr(model.config, "use_cache", None)
+    if old_use_cache is not None:
+        model.config.use_cache = False
+
+    if data and data[0].dim() == 1:
+        data = [tokens.unsqueeze(0) for tokens in data]
+
+    processed_layers = {
+        layer_idx for layer_idx in range(num_layers)
+        if os.path.exists(os.path.join(output_folder, f"l{layer_idx}.pt"))
+    }
+    logging.info(f"Processed HNLL layers: {sorted(processed_layers)}")
+    effective_layer_chunk_size = num_layers if layer_chunk_size == 0 else layer_chunk_size
+    logging.info(f"HNLL layer chunk size: {layer_chunk_size} (effective={effective_layer_chunk_size})")
+    logging.info(f"HNLL profiling: {profile}")
+    logging.info(f"HNLL Hessian builder: {hessian_builder}")
+    logging.info(f"HNLL Hessian group chunk size: {hessian_group_chunk_size}")
+    logging.info(f"HNLL validate shared-X: {validate_shared_x}")
+    logging.info(f"HNLL SDPA backend: {sdpa_backend}")
+
+    from .utils import get_progress_bar
+    pb = get_progress_bar(num_layers, "Accumulating HNLL HVP Hessians")
+
+    try:
+        with _sdpa_backend_context(sdpa_backend):
+            for batch_start in range(0, num_layers, effective_layer_chunk_size):
+                batch_layer_indices = [
+                    idx for idx in range(batch_start, min(batch_start + effective_layer_chunk_size, num_layers))
+                    if idx not in processed_layers
+                ]
+                if not batch_layer_indices:
+                    for skipped_idx in range(batch_start, min(batch_start + effective_layer_chunk_size, num_layers)):
+                        logging.info(f"Skipping HNLL layer {skipped_idx} because it has already been processed")
+                        pb.update(1)
+                    continue
+
+                batch_modules = {layer_idx: analyzer.get_modules(layers[layer_idx]) for layer_idx in batch_layer_indices}
+                results = {
+                    layer_idx: {
+                        name: torch.zeros(num_groups, module.weight.shape[1], module.weight.shape[1], dtype=torch.float32)
+                        for name, module in modules.items()
+                    }
+                    for layer_idx, modules in batch_modules.items()
+                }
+                valid_tokens_total = 0
+                hooks = []
+                captures = {}
+
+                logging.info(
+                    f"[HNLL] estimating layers {batch_layer_indices} with global multi-layer HVP "
+                    f"and {num_probes} probe(s)"
+                )
+
+                def make_hook(layer_idx, module_name):
+                    def hook(_module, inp, out):
+                        if not torch.is_tensor(out):
+                            raise TypeError(f"HNLL HVP expects tensor output for layer {layer_idx} {module_name}, got {type(out)}")
+                        captures[(layer_idx, module_name)] = (inp[0], out)
+                    return hook
+
+                for layer_idx, modules in batch_modules.items():
+                    for module_name, module in modules.items():
+                        hooks.append(module.register_forward_hook(make_hook(layer_idx, module_name)))
+
+                try:
+                    for sample_idx, tokens in enumerate(tqdm(data, desc=f"HNLL HVP layers {batch_layer_indices[0]}-{batch_layer_indices[-1]}", leave=False)):
+                        captures.clear()
+                        tokens = tokens.to(device)
+                        pad_token_id = getattr(analyzer.tokenizer, "pad_token_id", None)
+                        tokens, labels, attention_mask, valid_tokens = _prepare_hnll_tokens_and_labels(tokens, pad_token_id)
+                        if valid_tokens == 0:
+                            logging.warning("Skipping HNLL calibration batch with zero valid next-token labels")
+                            continue
+                        valid_tokens_total += valid_tokens
+
+                        forward_kwargs = {"input_ids": tokens, "labels": labels}
+                        if attention_mask is not None:
+                            forward_kwargs["attention_mask"] = attention_mask.to(device)
+                        if profile:
+                            sample_start = time.perf_counter()
+                            _cuda_sync_if_profiled(device, profile)
+                            phase_start = time.perf_counter()
+                        outputs = model(**forward_kwargs)
+                        loss_nll = outputs.loss * valid_tokens
+                        if profile:
+                            _cuda_sync_if_profiled(device, profile)
+                            forward_time = time.perf_counter() - phase_start
+                            phase_start = time.perf_counter()
+
+                        expected_keys = [
+                            (layer_idx, module_name)
+                            for layer_idx, modules in batch_modules.items()
+                            for module_name in modules.keys()
+                        ]
+                        missing_keys = [key for key in expected_keys if key not in captures]
+                        if missing_keys:
+                            raise RuntimeError(f"HNLL HVP did not capture target module outputs: {missing_keys}")
+
+                        module_keys = expected_keys
+                        xs = [captures[key][0] for key in module_keys]
+                        zs = [captures[key][1] for key in module_keys]
+                        hvp_scale = float(2 ** math.ceil(math.log2(max(len(zs), 1))))
+                        grad_zs = torch.autograd.grad(
+                            loss_nll,
+                            zs,
+                            create_graph=True,
+                            retain_graph=True,
+                            allow_unused=False,
+                        )
+                        if profile:
+                            _cuda_sync_if_profiled(device, profile)
+                            first_backward_time = time.perf_counter() - phase_start
+                            phase_start = time.perf_counter()
+                        group_accums = {
+                            key: torch.zeros(
+                                z.reshape(-1, z.shape[-1]).shape[0],
+                                num_groups,
+                                device=z.device,
+                                dtype=torch.float32,
+                            )
+                            for key, z in zip(module_keys, zs)
+                        }
+
+                        for probe_idx in range(num_probes):
+                            probes = [_rademacher_like(z) for z in zs]
+                            hvp_seed = torch.stack([
+                                (grad_z.float() * probe.float()).sum()
+                                for grad_z, probe in zip(grad_zs, probes)
+                            ]).sum() / hvp_scale
+                            hvps = torch.autograd.grad(
+                                hvp_seed,
+                                zs,
+                                retain_graph=probe_idx < num_probes - 1,
+                                create_graph=False,
+                                allow_unused=False,
+                            )
+                            for key, probe, hv in zip(module_keys, probes, hvps):
+                                diag_sample = (probe.float() * hv.float() * hvp_scale).reshape(-1, hv.shape[-1])
+                                if not torch.isfinite(diag_sample).all():
+                                    raise ValueError(
+                                        f"HNLL HVP produced non-finite curvature sample before Hessian build "
+                                        f"at layers {batch_layer_indices[0]}-{batch_layer_indices[-1]}, module {key}, "
+                                        f"probe={probe_idx}, hvp_scale={hvp_scale}. "
+                                        f"Try --nll_hvp_layer_chunk_size with a smaller contiguous chunk."
+                                    )
+                                group_accums[key].add_(reduce_channels_by_group_mean(diag_sample, num_groups))
+                        if profile:
+                            _cuda_sync_if_profiled(device, profile)
+                            hvp_time = time.perf_counter() - phase_start
+                            phase_start = time.perf_counter()
+
+                        sample_hessians = _build_hnll_sample_hessians(
+                            module_keys,
+                            xs,
+                            group_accums,
+                            num_probes,
+                            hessian_builder,
+                            hessian_group_chunk_size,
+                            validate_shared_x,
+                        )
+                        for key, hessian in sample_hessians.items():
+                            layer_idx, module_name = key
+                            if not torch.isfinite(hessian).all():
+                                raise ValueError(f"HNLL H contains non-finite values at layer {layer_idx}, module {module_name}")
+                            results[layer_idx][module_name].add_(hessian.detach().cpu())
+
+                        if profile:
+                            _cuda_sync_if_profiled(device, profile)
+                            build_h_time = time.perf_counter() - phase_start
+                            total_time = time.perf_counter() - sample_start
+                            allocated_gb = torch.cuda.memory_allocated(device) / (1024 ** 3) if device.type == "cuda" else 0.0
+                            reserved_gb = torch.cuda.memory_reserved(device) / (1024 ** 3) if device.type == "cuda" else 0.0
+                            logging.info(
+                                f"[HNLL][profile] layers={batch_layer_indices[0]}-{batch_layer_indices[-1]} "
+                                f"sample={sample_idx + 1}/{len(data)} valid_tokens={valid_tokens} hvp_scale={hvp_scale:.0f} "
+                                f"forward={forward_time:.3f}s first_backward={first_backward_time:.3f}s "
+                                f"global_hvp={hvp_time:.3f}s build_h={build_h_time:.3f}s total={total_time:.3f}s "
+                                f"cuda_alloc={allocated_gb:.2f}GiB cuda_reserved={reserved_gb:.2f}GiB"
+                            )
+
+                        del outputs, loss_nll, grad_zs, group_accums, probes, hvps, hvp_seed, sample_hessians
+                finally:
+                    for hook in hooks:
+                        hook.remove()
+
+                for layer_idx in batch_layer_indices:
+                    out_file = os.path.join(output_folder, f"l{layer_idx}.pt")
+                    for module_name, hessian in results[layer_idx].items():
+                        _log_hnll_hessian_stats(layer_idx, module_name, hessian, num_probes, valid_tokens_total)
+                    torch.save(results[layer_idx], out_file)
+                    logging.info(f"[Layer {layer_idx}] Saved HNLL HVP Hessians to {out_file}")
+                    pb.update(1)
+                del results
+                torch.cuda.empty_cache()
+    finally:
+        pb.close()
+        if old_use_cache is not None:
+            model.config.use_cache = old_use_cache
+        if "old_dtype" in locals() and "hnll_dtype" in locals() and hnll_dtype != old_dtype:
+            model.to(dtype=old_dtype)
+
+    logging.info("Done accumulating HNLL HVP Hessians for all layers.")
+    return False
+
+
+
+
+
