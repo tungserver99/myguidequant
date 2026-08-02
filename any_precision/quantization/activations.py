@@ -1780,6 +1780,9 @@ def accumulate_nll_hvp_hessians(
                                                 "HNLL finite-difference batched +/- signs hit CUDA OOM; "
                                                 "falling back to sequential +/- signs for this run."
                                             )
+                                            perturbations = None
+                                            perturbed_captures.clear()
+                                            captures.clear()
                                             torch.cuda.empty_cache()
                                             fd_batched_signs_active = False
                                             grads_plus = finite_diff_grads(probe_dict, 1.0)
