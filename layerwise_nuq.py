@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 from any_precision.quantization import layerwise_nuq
 
 def str2bool(v):
@@ -37,8 +37,8 @@ if __name__ == "__main__":
                         help='Number of CD cycles to run')
     parser.add_argument('--assignment_solver', choices=['cd', 'pair', 'pair_k2'], default='pair',
                         help='Assignment solver to use; pair is the default on this branch')
-    parser.add_argument('--hessian_source', choices=['saliency', 'nll_hvp', 'nll_ggn'], default='saliency',
-                        help='Hessian source for layerwise LNQ; nll_hvp uses Group-Trace Positive NLL HVP Hessian; nll_ggn uses first-order logits-covariance NLL-GGN')
+    parser.add_argument('--hessian_source', choices=['saliency', 'nll_hvp', 'nll_ggn', 'nll_base_residual_hvp', 'nll_fd_grouptrace'], default='saliency',
+                        help='Hessian source for layerwise LNQ; nll_hvp uses Group-Trace Positive NLL HVP Hessian; nll_ggn uses first-order logits-covariance NLL-GGN; nll_base_residual_hvp uses teacher-Fisher base plus residual HVP; nll_fd_grouptrace uses first-order central finite-difference GroupTrace HNLL')
     parser.add_argument('--nll_hvp_probes', type=int, default=1,
                         help='Number of Hutchinson probes for --hessian_source nll_hvp')
     parser.add_argument('--nll_hvp_layer_chunk_size', type=int, default=0,
@@ -63,6 +63,22 @@ if __name__ == "__main__":
                         help='Central finite-difference epsilon for --nll_hvp_engine finite_diff')
     parser.add_argument('--nll_hvp_fd_batched_signs', action='store_true',
                         help='Batch +epsilon and -epsilon finite-difference passes into one 2B forward/backward when memory allows')
+    parser.add_argument('--nll_base_mode', choices=['teacher_real_fisher'], default='teacher_real_fisher',
+                        help='Base curvature mode for --hessian_source nll_base_residual_hvp')
+    parser.add_argument('--nll_residual_hvp_probes', type=int, default=1,
+                        help='Number of residual-only HVP probes for --hessian_source nll_base_residual_hvp')
+    parser.add_argument('--nll_residual_hvp_layer_chunk_size', type=int, default=0,
+                        help='Target-layer chunk size for residual-only HVP; 0 means all target layers')
+    parser.add_argument('--nll_residual_hvp_sdpa_backend', choices=['math', 'auto', 'flash', 'efficient', 'cudnn'], default='math',
+                        help='SDPA backend for residual-only HVP path')
+    parser.add_argument('--fd_execution_mode', choices=['sequential', 'paired_batch'], default='paired_batch',
+                        help='Execution mode for --hessian_source nll_fd_grouptrace; paired_batch batches +alpha/-alpha and falls back to sequential on CUDA OOM')
+    parser.add_argument('--fd_scale_mode', choices=['fixed', 'activation_rms'], default='activation_rms',
+                        help='Finite-difference alpha scale for --hessian_source nll_fd_grouptrace')
+    parser.add_argument('--fd_scale_multiplier', type=float, default=1e-2,
+                        help='Multiplier for finite-difference alpha; activation_rms uses alpha=max(multiplier*rms(A), 1e-6)')
+    parser.add_argument('--fd_build_flush_interval', type=int, default=8,
+                        help='Number of calibration samples buffered before building FD GroupTrace H; 0 means flush only at the end')
     parser.add_argument("--sub_qlayer", nargs='+', type=int, default=None,
                         help="(start, end) of layers to use for quantization")
     parser.add_argument("--is_nosal", type=str2bool, default=False,
@@ -74,6 +90,7 @@ if __name__ == "__main__":
 
     # only pass options that are not None
     layerwise_nuq(**{k: v for k, v in args.__dict__.items() if v is not None})
+
 
 
 

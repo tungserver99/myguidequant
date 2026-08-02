@@ -74,24 +74,45 @@ class SqllmRunnerScriptTest(unittest.TestCase):
         self.assertNotIn("pair", text.lower())
         self.assertNotIn("triton", text.lower())
 
-    def test_nll_ggn_runner_uses_nll_ggn_source_and_cd(self):
-        script = Path("scripts/run_lnq_guidedquant_nll_ggn_cd_c4_eval_ppl.sh")
+    def test_fd_grouptrace_runner_uses_fd_grouptrace_hnll_and_cd(self):
+        script = Path("scripts/run_lnq_guidedquant_fd_grouptrace_cd_c4_eval_ppl.sh")
         text = script.read_text()
 
-        self.assertIn('CACHE_DIR="${CACHE_DIR:-cache_nll_ggn_cd}"', text)
-        self.assertIn('RESULT_SUFFIX="nll_ggn_cd"', text)
-        self.assertIn('HESSIAN_SUFFIX="nll_ggn_p${NLL_GGN_PROBES}_dt${NLL_GGN_DTYPE}_hb${NLL_HESSIAN_BUILDER}_gcs${NLL_HESSIAN_GROUP_CHUNK_SIZE}"', text)
-        self.assertIn('--hessian_source nll_ggn', text)
-        self.assertIn('--nll_hvp_probes "${NLL_GGN_PROBES}"', text)
-        self.assertIn('--nll_hvp_dtype "${NLL_GGN_DTYPE}"', text)
+        self.assertIn('CACHE_DIR="${CACHE_DIR:-cache_hnll_fd_grouptrace_cd}"', text)
+        self.assertIn('RESULT_SUFFIX="hnll_fd_grouptrace_cd"', text)
+        self.assertIn('HESSIAN_SUFFIX="hnll_fd_grouptrace_p${FD_NUM_PROBES}_mode${FD_EXECUTION_MODE}_scale${FD_SCALE_MODE}_mul${FD_SCALE_MULTIPLIER}_flush${FD_BUILD_FLUSH_INTERVAL}_dt${NLL_FD_DTYPE}_hb${NLL_HESSIAN_BUILDER}_gcs${NLL_HESSIAN_GROUP_CHUNK_SIZE}"', text)
+        self.assertIn('--hessian_source nll_fd_grouptrace', text)
+        self.assertIn('--fd_execution_mode "${FD_EXECUTION_MODE}"', text)
+        self.assertIn('--fd_scale_mode "${FD_SCALE_MODE}"', text)
+        self.assertIn('--fd_scale_multiplier "${FD_SCALE_MULTIPLIER}"', text)
+        self.assertIn('--fd_build_flush_interval "${FD_BUILD_FLUSH_INTERVAL}"', text)
+        self.assertIn('ASSIGNMENT_SOLVER="cd"', text)
+        self.assertNotIn("pair_k2", text.lower())
+        self.assertNotIn("triton", text.lower())
+    def test_fast_hnll_residual_runner_uses_base_residual_hvp_and_cd(self):
+        script = Path("scripts/run_lnq_guidedquant_fast_hnll_residual_cd_c4_eval_ppl.sh")
+        text = script.read_text()
+
+        self.assertIn('CACHE_DIR="${CACHE_DIR:-cache_fast_hnll_residual_cd}"', text)
+        self.assertIn('RESULT_SUFFIX="fast_hnll_residual_cd"', text)
+        self.assertIn('HESSIAN_SUFFIX="fast_hnll_base${NLL_BASE_MODE}_residual_p${NLL_RESIDUAL_HVP_PROBES}_lc${NLL_RESIDUAL_HVP_LAYER_CHUNK_SIZE}_dt${NLL_FAST_DTYPE}_hb${NLL_HESSIAN_BUILDER}_gcs${NLL_HESSIAN_GROUP_CHUNK_SIZE}"', text)
+        self.assertIn('--hessian_source nll_base_residual_hvp', text)
+        self.assertIn('--nll_base_mode "${NLL_BASE_MODE}"', text)
+        self.assertIn('--nll_residual_hvp_probes "${NLL_RESIDUAL_HVP_PROBES}"', text)
+        self.assertIn('--nll_residual_hvp_layer_chunk_size "${NLL_RESIDUAL_HVP_LAYER_CHUNK_SIZE}"', text)
         self.assertIn('--nll_hessian_builder "${NLL_HESSIAN_BUILDER}"', text)
         self.assertIn('NLL_HESSIAN_BUILDER="batched_shared_x"', text)
         self.assertIn('ASSIGNMENT_SOLVER="cd"', text)
+        quantize_section = text.split('python quantize.py "${MODEL_NAME}"', 1)[1].split('python layerwise_nuq.py "${MODEL_NAME}"', 1)[0]
+        layerwise_section = text.split('python layerwise_nuq.py "${MODEL_NAME}"', 1)[1]
+        self.assertNotIn('--num_groups "${NUM_GROUPS}"', quantize_section)
+        self.assertIn('--num_groups "${NUM_GROUPS}"', layerwise_section)
         self.assertNotIn("finite_diff", text)
         self.assertNotIn("pair", text.lower())
         self.assertNotIn("triton", text.lower())
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

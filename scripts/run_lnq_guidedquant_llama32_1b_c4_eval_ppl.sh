@@ -9,6 +9,7 @@ set -x
 # Override with environment variables if needed:
 #   MODEL_NAME, BITS, NUM_GROUPS, MODE, CACHE_DIR, EVAL_CACHE_DIR,
 #   EVAL_METHOD, EVAL_STRIDE, EVAL_DTYPE, NUM_ITERATIONS, CD_CYCLES,
+#   ASSIGNMENT_SOLVER,
 #   RANDOM_STATE, OVERWRITE
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +25,7 @@ SEQ_LEN="${SEQ_LEN:-2048}"
 NUM_EXAMPLES="${NUM_EXAMPLES:-128}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-3}"
 CD_CYCLES="${CD_CYCLES:-4}"
+ASSIGNMENT_SOLVER="${ASSIGNMENT_SOLVER:-cd}"
 RANDOM_STATE="${RANDOM_STATE:-42}"
 OVERWRITE="${OVERWRITE:-0}"
 CACHE_DIR="${CACHE_DIR:-cache}"
@@ -83,6 +85,7 @@ python layerwise_nuq.py "${MODEL_NAME}" \
   --num_groups "${NUM_GROUPS}" \
   --num_iterations "${NUM_ITERATIONS}" \
   --cd_cycles "${CD_CYCLES}" \
+  --assignment_solver "${ASSIGNMENT_SOLVER}" \
   --mode "${MODE}" \
   --cache_dir "${CACHE_DIR}" \
   --random_state "${RANDOM_STATE}" \

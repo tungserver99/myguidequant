@@ -1,4 +1,4 @@
-﻿
+
 import os
 import os.path
 import shutil
@@ -6,7 +6,7 @@ import logging
 
 from .config import *
 from ..analyzer import get_analyzer
-from .activations import accumulate_nll_ggn_hessians, accumulate_nll_hvp_hessians, accumulate_saliency_weighted_hessians
+from .activations import accumulate_fast_hnll_base_residual_hvp_hessians, accumulate_fd_grouptrace_hnll_hessians, accumulate_nll_ggn_hessians, accumulate_nll_hvp_hessians, accumulate_saliency_weighted_hessians
 from .layerwise_quantize import seed
 from .pack import pack
 from .datautils import get_tokens
@@ -49,6 +49,14 @@ def layerwise_nuq(
         nll_hvp_engine="autograd",
         nll_hvp_fd_epsilon=1e-3,
         nll_hvp_fd_batched_signs=False,
+        nll_base_mode="teacher_real_fisher",
+        nll_residual_hvp_probes=1,
+        nll_residual_hvp_layer_chunk_size=0,
+        nll_residual_hvp_sdpa_backend="math",
+        fd_execution_mode="paired_batch",
+        fd_scale_mode="activation_rms",
+        fd_scale_multiplier=1e-2,
+        fd_build_flush_interval=8,
         sub_qlayer=None,
         is_nosal=False,
 ):
@@ -69,8 +77,8 @@ def layerwise_nuq(
                           f"{model_name}"
                           f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}")
 
-    if hessian_source not in ("saliency", "nll_hvp", "nll_ggn"):
-        raise ValueError(f"Unsupported hessian_source={hessian_source!r}; expected saliency, nll_hvp, or nll_ggn")
+    if hessian_source not in ("saliency", "nll_hvp", "nll_ggn", "nll_base_residual_hvp", "nll_fd_grouptrace"):
+        raise ValueError(f"Unsupported hessian_source={hessian_source!r}; expected saliency, nll_hvp, nll_ggn, nll_base_residual_hvp, or nll_fd_grouptrace")
 
     hessian_suffix = "_nosal" if is_nosal else ""
     if hessian_source == "nll_hvp":
@@ -87,7 +95,17 @@ def layerwise_nuq(
         hessian_suffix = f"_nll_ggn_p{nll_hvp_probes}_dt{nll_hvp_dtype}"
         if nll_hessian_builder != "legacy":
             hessian_suffix += f"_hb{nll_hessian_builder}_gcs{nll_hessian_group_chunk_size}"
+    elif hessian_source == "nll_base_residual_hvp":
+        hessian_suffix = f"_fast_hnll_base{nll_base_mode}_residual_p{nll_residual_hvp_probes}_lc{nll_residual_hvp_layer_chunk_size}_dt{nll_hvp_dtype}"
+        if nll_hessian_builder != "legacy":
+            hessian_suffix += f"_hb{nll_hessian_builder}_gcs{nll_hessian_group_chunk_size}"
+        if nll_residual_hvp_sdpa_backend != "math":
+            hessian_suffix += f"_sdpa{nll_residual_hvp_sdpa_backend}"
 
+    elif hessian_source == "nll_fd_grouptrace":
+        hessian_suffix = f"_hnll_fd_grouptrace_p{nll_hvp_probes}_mode{fd_execution_mode}_scale{fd_scale_mode}_mul{fd_scale_multiplier:g}_flush{fd_build_flush_interval}_dt{nll_hvp_dtype}"
+        if nll_hessian_builder != "legacy":
+            hessian_suffix += f"_hb{nll_hessian_builder}_gcs{nll_hessian_group_chunk_size}"
     hessians_cache_path = (f"{cache_dir}/hessians/"
                           f"{model_name}"
                           f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{hessian_suffix}")
@@ -134,6 +152,14 @@ def layerwise_nuq(
     logging.info(f"NLL HVP engine: {nll_hvp_engine}")
     logging.info(f"NLL HVP finite-difference epsilon: {nll_hvp_fd_epsilon}")
     logging.info(f"NLL HVP finite-difference batched +/- signs: {nll_hvp_fd_batched_signs}")
+    logging.info(f"NLL base mode: {nll_base_mode}")
+    logging.info(f"NLL residual HVP probes: {nll_residual_hvp_probes}")
+    logging.info(f"NLL residual HVP layer chunk size: {nll_residual_hvp_layer_chunk_size}")
+    logging.info(f"NLL residual HVP SDPA backend: {nll_residual_hvp_sdpa_backend}")
+    logging.info(f"FD GroupTrace execution mode: {fd_execution_mode}")
+    logging.info(f"FD GroupTrace scale mode: {fd_scale_mode}")
+    logging.info(f"FD GroupTrace scale multiplier: {fd_scale_multiplier}")
+    logging.info(f"FD GroupTrace build flush interval: {fd_build_flush_interval}")
 
     # ------------------- Log mode and other options -------------------
 
@@ -207,6 +233,34 @@ def layerwise_nuq(
             hessian_builder=nll_hessian_builder,
             hessian_group_chunk_size=nll_hessian_group_chunk_size,
             validate_shared_x=nll_hessian_validate_shared_x,
+        )
+    elif hessian_source == "nll_base_residual_hvp":
+        from_cache = accumulate_fast_hnll_base_residual_hvp_hessians(
+            analyzer, tokens, hessians_cache_path, num_groups,
+            num_probes=nll_residual_hvp_probes, random_state=random_state,
+            layer_chunk_size=nll_residual_hvp_layer_chunk_size,
+            profile=nll_hvp_profile,
+            curvature_dtype=nll_hvp_dtype,
+            hessian_builder=nll_hessian_builder,
+            hessian_group_chunk_size=nll_hessian_group_chunk_size,
+            validate_shared_x=nll_hessian_validate_shared_x,
+            base_mode=nll_base_mode,
+            sdpa_backend=nll_residual_hvp_sdpa_backend,
+        )
+    elif hessian_source == "nll_fd_grouptrace":
+        from_cache = accumulate_fd_grouptrace_hnll_hessians(
+            analyzer, tokens, hessians_cache_path, num_groups,
+            num_probes=nll_hvp_probes, random_state=random_state,
+            layer_chunk_size=nll_hvp_layer_chunk_size,
+            profile=nll_hvp_profile,
+            curvature_dtype=nll_hvp_dtype,
+            hessian_builder=nll_hessian_builder,
+            hessian_group_chunk_size=nll_hessian_group_chunk_size,
+            validate_shared_x=nll_hessian_validate_shared_x,
+            fd_execution_mode=fd_execution_mode,
+            fd_scale_mode=fd_scale_mode,
+            fd_scale_multiplier=fd_scale_multiplier,
+            fd_build_flush_interval=fd_build_flush_interval,
         )
     else:
         from_cache = accumulate_saliency_weighted_hessians(analyzer, tokens, saliency_cache_path, hessians_cache_path, num_groups)
