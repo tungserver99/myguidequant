@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import unittest
 
 
@@ -73,8 +73,28 @@ class SqllmRunnerScriptTest(unittest.TestCase):
         self.assertIn('ASSIGNMENT_SOLVER="cd"', text)
         self.assertNotIn("pair", text.lower())
         self.assertNotIn("triton", text.lower())
+
+    def test_nll_ggn_runner_uses_nll_ggn_source_and_cd(self):
+        script = Path("scripts/run_lnq_guidedquant_nll_ggn_cd_c4_eval_ppl.sh")
+        text = script.read_text()
+
+        self.assertIn('CACHE_DIR="${CACHE_DIR:-cache_nll_ggn_cd}"', text)
+        self.assertIn('RESULT_SUFFIX="nll_ggn_cd"', text)
+        self.assertIn('HESSIAN_SUFFIX="nll_ggn_p${NLL_GGN_PROBES}_dt${NLL_GGN_DTYPE}_hb${NLL_HESSIAN_BUILDER}_gcs${NLL_HESSIAN_GROUP_CHUNK_SIZE}"', text)
+        self.assertIn('--hessian_source nll_ggn', text)
+        self.assertIn('--nll_hvp_probes "${NLL_GGN_PROBES}"', text)
+        self.assertIn('--nll_hvp_dtype "${NLL_GGN_DTYPE}"', text)
+        self.assertIn('--nll_hessian_builder "${NLL_HESSIAN_BUILDER}"', text)
+        self.assertIn('NLL_HESSIAN_BUILDER="batched_shared_x"', text)
+        self.assertIn('ASSIGNMENT_SOLVER="cd"', text)
+        self.assertNotIn("finite_diff", text)
+        self.assertNotIn("pair", text.lower())
+        self.assertNotIn("triton", text.lower())
 if __name__ == "__main__":
     unittest.main()
+
+
+
 
 
 

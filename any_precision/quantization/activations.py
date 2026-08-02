@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn as nn
 from tqdm.auto import trange
 import os
@@ -732,14 +732,15 @@ def build_group_hessians_legacy(x: torch.Tensor, stats: torch.Tensor) -> torch.T
     _validate_hessian_builder_inputs(x, stats)
     x = x.float()
     stats = stats.float()
-    hessians = []
+    hessians = torch.empty(
+        stats.shape[1], x.shape[1], x.shape[1],
+        device=x.device, dtype=torch.float32,
+    )
     for group_idx in range(stats.shape[1]):
         sqrt_s = torch.sqrt(stats[:, group_idx]).unsqueeze(-1)
         x_weighted = x * sqrt_s
-        hessian = x_weighted.T @ x_weighted
-        hessians.append(hessian)
-    hessians = torch.stack(hessians, dim=0)
-    return 0.5 * (hessians + hessians.transpose(-1, -2))
+        hessians[group_idx].copy_(x_weighted.T @ x_weighted)
+    return hessians
 
 
 def build_group_hessians_batched(x: torch.Tensor, stats: torch.Tensor, group_chunk_size: int) -> torch.Tensor:
@@ -749,16 +750,18 @@ def build_group_hessians_batched(x: torch.Tensor, stats: torch.Tensor, group_chu
 
     x = x.float()
     stats = stats.float()
-    chunks = []
+    hessians = torch.empty(
+        stats.shape[1], x.shape[1], x.shape[1],
+        device=x.device, dtype=torch.float32,
+    )
     for start in range(0, stats.shape[1], group_chunk_size):
         end = min(start + group_chunk_size, stats.shape[1])
         sqrt_s = torch.sqrt(stats[:, start:end]).transpose(0, 1)
         x_weighted = sqrt_s.unsqueeze(-1) * x.unsqueeze(0)
         h_chunk = torch.bmm(x_weighted.transpose(1, 2), x_weighted)
-        chunks.append(h_chunk)
-
-    hessians = torch.cat(chunks, dim=0)
-    return 0.5 * (hessians + hessians.transpose(-1, -2))
+        hessians[start:end].copy_(h_chunk)
+        del sqrt_s, x_weighted, h_chunk
+    return hessians
 
 
 def build_shared_x_group_hessians(x: torch.Tensor, module_group_stats, group_chunk_size: int):
@@ -814,11 +817,11 @@ def _build_hnll_sample_hessians(
         stats_by_key[key] = s_pos
 
     if builder == "legacy":
-        return {key: build_group_hessians_from_curvature(x_by_key[key], stats_by_key[key]) for key in module_keys}
+        return {key: build_group_hessians_from_curvature(x_by_key[key], stats_by_key[key]).detach().cpu() for key in module_keys}
 
     if builder == "batched":
         return {
-            key: build_group_hessians_batched(x_by_key[key], stats_by_key[key], group_chunk_size)
+            key: build_group_hessians_batched(x_by_key[key], stats_by_key[key], group_chunk_size).detach().cpu()
             for key in module_keys
         }
 
@@ -841,13 +844,261 @@ def _build_hnll_sample_hessians(
 
         if not can_fuse:
             for key in keys:
-                hessians[key] = build_group_hessians_batched(x_by_key[key], stats_by_key[key], group_chunk_size)
+                hessians[key] = build_group_hessians_batched(x_by_key[key], stats_by_key[key], group_chunk_size).detach().cpu()
             continue
 
         module_group_stats = {key: stats_by_key[key] for key in keys}
-        hessians.update(build_shared_x_group_hessians(base_x, module_group_stats, group_chunk_size))
+        for key, hessian in build_shared_x_group_hessians(base_x, module_group_stats, group_chunk_size).items():
+            hessians[key] = hessian.detach().cpu()
 
     return hessians
+
+def accumulate_nll_ggn_hessians(
+    analyzer,
+    data: List[torch.Tensor],
+    output_folder: str,
+    num_groups: int,
+    num_probes: int = 1,
+    random_state: Optional[int] = None,
+    layer_chunk_size: int = 0,
+    profile: bool = False,
+    curvature_dtype: str = "auto",
+    hessian_builder: str = "legacy",
+    hessian_group_chunk_size: int = 4,
+    validate_shared_x: bool = False,
+) -> bool:
+    """Accumulate PSD NLL-GGN Hessians using first-order logits-covariance probes.
+
+    The estimator uses u = one_hot(y~p) - p at valid next-token logits, so
+    E[u u^T] = Diag(p) - p p^T. Backpropagating logits·u to each target
+    linear output Z gives J_Z^T u; squaring estimates diag(J_Z^T C J_Z).
+    """
+    if num_probes < 1:
+        raise ValueError(f"num_probes must be >= 1, got {num_probes}")
+    if layer_chunk_size < 0:
+        raise ValueError(f"layer_chunk_size must be >= 0, got {layer_chunk_size}")
+
+    layers = analyzer.get_layers()
+    num_layers = len(layers)
+    if output_folder and os.path.exists(output_folder):
+        if all(os.path.exists(os.path.join(output_folder, f"l{i}.pt")) for i in range(num_layers)):
+            logging.info(f"Cached NLL-GGN hessians found in {output_folder}")
+            return True
+
+    if random_state is not None:
+        torch.manual_seed(random_state)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(random_state)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    os.makedirs(output_folder, exist_ok=True)
+    model = analyzer.model
+    model.eval()
+    old_param = next(model.parameters())
+    old_dtype = old_param.dtype
+    ggn_dtype = _resolve_hnll_curvature_dtype(curvature_dtype, device, old_dtype)
+    logging.info(f"NLL-GGN curvature dtype: {ggn_dtype} (requested={curvature_dtype}, original={old_dtype})")
+    model.to(device=device, dtype=ggn_dtype)
+
+    old_use_cache = getattr(model.config, "use_cache", None)
+    if old_use_cache is not None:
+        model.config.use_cache = False
+
+    if data and data[0].dim() == 1:
+        data = [tokens.unsqueeze(0) for tokens in data]
+
+    processed_layers = {
+        layer_idx for layer_idx in range(num_layers)
+        if os.path.exists(os.path.join(output_folder, f"l{layer_idx}.pt"))
+    }
+    effective_layer_chunk_size = num_layers if layer_chunk_size == 0 else layer_chunk_size
+    logging.info(f"Processed NLL-GGN layers: {sorted(processed_layers)}")
+    logging.info(f"NLL-GGN layer chunk size: {layer_chunk_size} (effective={effective_layer_chunk_size})")
+    logging.info(f"NLL-GGN probes: {num_probes}")
+    logging.info(f"NLL-GGN profiling: {profile}")
+    logging.info(f"NLL-GGN Hessian builder: {hessian_builder}")
+    logging.info(f"NLL-GGN Hessian group chunk size: {hessian_group_chunk_size}")
+    logging.info(f"NLL-GGN validate shared-X: {validate_shared_x}")
+
+    from .utils import get_progress_bar
+    pb = get_progress_bar(num_layers, "Accumulating NLL-GGN Hessians")
+
+    try:
+        for batch_start in range(0, num_layers, effective_layer_chunk_size):
+            batch_layer_indices = [
+                idx for idx in range(batch_start, min(batch_start + effective_layer_chunk_size, num_layers))
+                if idx not in processed_layers
+            ]
+            if not batch_layer_indices:
+                for skipped_idx in range(batch_start, min(batch_start + effective_layer_chunk_size, num_layers)):
+                    if skipped_idx in processed_layers:
+                        pb.update(1)
+                continue
+
+            batch_modules = {layer_idx: analyzer.get_modules(layers[layer_idx]) for layer_idx in batch_layer_indices}
+            results = {
+                layer_idx: {
+                    name: torch.zeros(num_groups, module.weight.shape[1], module.weight.shape[1], dtype=torch.float32)
+                    for name, module in modules.items()
+                }
+                for layer_idx, modules in batch_modules.items()
+            }
+            valid_tokens_total = 0
+            hooks = []
+            captures = {}
+
+            logging.info(
+                f"[NLL-GGN] estimating layers {batch_layer_indices} with {num_probes} logits-covariance probe(s)"
+            )
+
+            def make_hook(layer_idx, module_name):
+                key = (layer_idx, module_name)
+                def hook(_module, inp, out):
+                    if not torch.is_tensor(out):
+                        raise TypeError(f"NLL-GGN expects tensor output for layer {layer_idx} {module_name}, got {type(out)}")
+                    captures[key] = (inp[0], out)
+                    return None
+                return hook
+
+            for layer_idx, modules in batch_modules.items():
+                for module_name, module in modules.items():
+                    hooks.append(module.register_forward_hook(make_hook(layer_idx, module_name)))
+
+            try:
+                for sample_idx, tokens in enumerate(tqdm(data, desc=f"NLL-GGN layers {batch_layer_indices[0]}-{batch_layer_indices[-1]}", leave=False)):
+                    captures.clear()
+                    tokens = tokens.to(device)
+                    pad_token_id = getattr(analyzer.tokenizer, "pad_token_id", None)
+                    tokens, labels, attention_mask, valid_tokens = _prepare_hnll_tokens_and_labels(tokens, pad_token_id)
+                    if valid_tokens == 0:
+                        logging.warning("Skipping NLL-GGN calibration batch with zero valid next-token labels")
+                        continue
+                    valid_tokens_total += valid_tokens
+
+                    forward_kwargs = {"input_ids": tokens, "labels": labels}
+                    if attention_mask is not None:
+                        forward_kwargs["attention_mask"] = attention_mask.to(device)
+
+                    if profile:
+                        sample_start = time.perf_counter()
+                        _cuda_sync_if_profiled(device, profile)
+                        phase_start = time.perf_counter()
+
+                    outputs = model(**forward_kwargs)
+                    if not hasattr(outputs, "logits"):
+                        raise RuntimeError("NLL-GGN requires model outputs.logits")
+                    logits = outputs.logits
+
+                    if profile:
+                        _cuda_sync_if_profiled(device, profile)
+                        forward_time = time.perf_counter() - phase_start
+                        phase_start = time.perf_counter()
+
+                    expected_keys = [
+                        (layer_idx, module_name)
+                        for layer_idx, modules in batch_modules.items()
+                        for module_name in modules.keys()
+                    ]
+                    missing_keys = [key for key in expected_keys if key not in captures]
+                    if missing_keys:
+                        raise RuntimeError(f"NLL-GGN did not capture target module outputs: {missing_keys}")
+
+                    module_keys = expected_keys
+                    xs = [captures[key][0].detach() for key in module_keys]
+                    zs = [captures[key][1] for key in module_keys]
+                    group_accums = {
+                        key: torch.zeros(
+                            z.reshape(-1, z.shape[-1]).shape[0],
+                            num_groups,
+                            device=z.device,
+                            dtype=torch.float32,
+                        )
+                        for key, z in zip(module_keys, zs)
+                    }
+
+                    logits_shift = logits[:, :-1, :]
+                    valid_mask = labels[:, 1:].ne(-100)
+                    if logits_shift.shape[:2] != valid_mask.shape:
+                        raise RuntimeError(
+                            f"NLL-GGN logits/label shift mismatch: logits={tuple(logits_shift.shape)}, mask={tuple(valid_mask.shape)}"
+                        )
+                    flat_probs = torch.softmax(logits_shift.float(), dim=-1).detach().reshape(-1, logits_shift.shape[-1])
+                    valid_mask_f = valid_mask.float()
+
+                    for probe_idx in range(num_probes):
+                        sampled = torch.multinomial(flat_probs, num_samples=1).reshape(logits_shift.shape[:2])
+                        selected = logits_shift.gather(-1, sampled.unsqueeze(-1)).squeeze(-1).float()
+                        expected_logit = (logits_shift.float() * flat_probs.reshape_as(logits_shift.float())).sum(dim=-1)
+                        probe_scalar = ((selected - expected_logit) * valid_mask_f).sum()
+                        grads = torch.autograd.grad(
+                            probe_scalar,
+                            zs,
+                            retain_graph=probe_idx < num_probes - 1,
+                            create_graph=False,
+                            allow_unused=False,
+                        )
+                        for key, grad in zip(module_keys, grads):
+                            diag_sample = grad.float().square().reshape(-1, grad.shape[-1])
+                            if not torch.isfinite(diag_sample).all():
+                                raise ValueError(
+                                    f"NLL-GGN produced non-finite curvature sample at layers "
+                                    f"{batch_layer_indices[0]}-{batch_layer_indices[-1]}, module {key}, probe={probe_idx}."
+                                )
+                            group_accums[key].add_(reduce_channels_by_group_mean(diag_sample, num_groups))
+
+                    del flat_probs, logits_shift, valid_mask, valid_mask_f, grads, sampled, selected, expected_logit, probe_scalar
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+                    sample_hessians = _build_hnll_sample_hessians(
+                        module_keys,
+                        xs,
+                        group_accums,
+                        num_probes,
+                        hessian_builder,
+                        hessian_group_chunk_size,
+                        validate_shared_x,
+                    )
+                    for key, hessian in sample_hessians.items():
+                        layer_idx, module_name = key
+                        if not torch.isfinite(hessian).all():
+                            raise ValueError(f"NLL-GGN H contains non-finite values at layer {layer_idx}, module {module_name}")
+                        results[layer_idx][module_name].add_(hessian.detach().cpu())
+
+                    if profile:
+                        _cuda_sync_if_profiled(device, profile)
+                        total_time = time.perf_counter() - sample_start
+                        ggn_time = time.perf_counter() - phase_start
+                        logging.info(
+                            f"[NLL-GGN][profile] layers={batch_layer_indices[0]}-{batch_layer_indices[-1]} "
+                            f"sample={sample_idx + 1}/{len(data)} valid_tokens={valid_tokens} "
+                            f"forward={forward_time:.3f}s ggn_backward_build={ggn_time:.3f}s total={total_time:.3f}s"
+                        )
+
+                    del outputs, logits, group_accums, sample_hessians
+            finally:
+                for hook in hooks:
+                    hook.remove()
+
+            for layer_idx in batch_layer_indices:
+                out_file = os.path.join(output_folder, f"l{layer_idx}.pt")
+                for module_name, hessian in results[layer_idx].items():
+                    _log_hnll_hessian_stats(layer_idx, module_name, hessian, num_probes, valid_tokens_total)
+                torch.save(results[layer_idx], out_file)
+                logging.info(f"[Layer {layer_idx}] Saved NLL-GGN Hessians to {out_file}")
+                pb.update(1)
+            del results
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    finally:
+        pb.close()
+        if old_use_cache is not None:
+            model.config.use_cache = old_use_cache
+        if "old_dtype" in locals() and "ggn_dtype" in locals() and ggn_dtype != old_dtype:
+            model.to(dtype=old_dtype)
+
+    logging.info("Done accumulating NLL-GGN Hessians for all layers.")
+    return False
 
 def _log_hnll_hessian_stats(layer_idx: int, module_name: str, hessian: torch.Tensor, num_probes: int, valid_tokens: int):
     h = hessian.detach().float()
@@ -874,6 +1125,9 @@ def accumulate_nll_hvp_hessians(
     hessian_group_chunk_size: int = 4,
     validate_shared_x: bool = False,
     sdpa_backend: str = "math",
+    hvp_engine: str = "autograd",
+    fd_epsilon: float = 1e-3,
+    fd_batched_signs: bool = False,
 ) -> bool:
     """Accumulate Group-Trace Positive NLL Hessians via autograd HVP.
 
@@ -887,6 +1141,10 @@ def accumulate_nll_hvp_hessians(
         raise ValueError(f"num_probes must be >= 1, got {num_probes}")
     if layer_chunk_size < 0:
         raise ValueError(f"layer_chunk_size must be >= 0, got {layer_chunk_size}")
+    if hvp_engine not in ("autograd", "finite_diff"):
+        raise ValueError(f"Unsupported nll_hvp_engine={hvp_engine!r}")
+    if fd_epsilon <= 0:
+        raise ValueError(f"fd_epsilon must be positive, got {fd_epsilon}")
 
     layers = analyzer.get_layers()
     num_layers = len(layers)
@@ -932,6 +1190,9 @@ def accumulate_nll_hvp_hessians(
     logging.info(f"HNLL Hessian group chunk size: {hessian_group_chunk_size}")
     logging.info(f"HNLL validate shared-X: {validate_shared_x}")
     logging.info(f"HNLL SDPA backend: {sdpa_backend}")
+    logging.info(f"HNLL HVP engine: {hvp_engine}")
+    logging.info(f"HNLL finite-difference epsilon: {fd_epsilon}")
+    logging.info(f"HNLL finite-difference batched +/- signs: {fd_batched_signs}")
 
     from .utils import get_progress_bar
     pb = get_progress_bar(num_layers, "Accumulating HNLL HVP Hessians")
@@ -960,6 +1221,8 @@ def accumulate_nll_hvp_hessians(
                 valid_tokens_total = 0
                 hooks = []
                 captures = {}
+                perturbations = None
+                perturbed_captures = {}
 
                 logging.info(
                     f"[HNLL] estimating layers {batch_layer_indices} with global multi-layer HVP "
@@ -967,10 +1230,16 @@ def accumulate_nll_hvp_hessians(
                 )
 
                 def make_hook(layer_idx, module_name):
+                    key = (layer_idx, module_name)
                     def hook(_module, inp, out):
                         if not torch.is_tensor(out):
                             raise TypeError(f"HNLL HVP expects tensor output for layer {layer_idx} {module_name}, got {type(out)}")
-                        captures[(layer_idx, module_name)] = (inp[0], out)
+                        captures[key] = (inp[0], out)
+                        if perturbations is not None and key in perturbations:
+                            perturbed_out = out + perturbations[key]
+                            perturbed_captures[key] = perturbed_out
+                            return perturbed_out
+                        return None
                     return hook
 
                 for layer_idx, modules in batch_modules.items():
@@ -1012,20 +1281,9 @@ def accumulate_nll_hvp_hessians(
                             raise RuntimeError(f"HNLL HVP did not capture target module outputs: {missing_keys}")
 
                         module_keys = expected_keys
-                        xs = [captures[key][0] for key in module_keys]
+                        xs = [captures[key][0].detach() for key in module_keys]
                         zs = [captures[key][1] for key in module_keys]
                         hvp_scale = float(2 ** math.ceil(math.log2(max(len(zs), 1))))
-                        grad_zs = torch.autograd.grad(
-                            loss_nll,
-                            zs,
-                            create_graph=True,
-                            retain_graph=True,
-                            allow_unused=False,
-                        )
-                        if profile:
-                            _cuda_sync_if_profiled(device, profile)
-                            first_backward_time = time.perf_counter() - phase_start
-                            phase_start = time.perf_counter()
                         group_accums = {
                             key: torch.zeros(
                                 z.reshape(-1, z.shape[-1]).shape[0],
@@ -1036,33 +1294,160 @@ def accumulate_nll_hvp_hessians(
                             for key, z in zip(module_keys, zs)
                         }
 
-                        for probe_idx in range(num_probes):
-                            probes = [_rademacher_like(z) for z in zs]
-                            hvp_seed = torch.stack([
-                                (grad_z.float() * probe.float()).sum()
-                                for grad_z, probe in zip(grad_zs, probes)
-                            ]).sum() / hvp_scale
-                            hvps = torch.autograd.grad(
-                                hvp_seed,
+                        if hvp_engine == "autograd":
+                            grad_zs = torch.autograd.grad(
+                                loss_nll,
                                 zs,
-                                retain_graph=probe_idx < num_probes - 1,
-                                create_graph=False,
+                                create_graph=True,
+                                retain_graph=True,
                                 allow_unused=False,
                             )
-                            for key, probe, hv in zip(module_keys, probes, hvps):
-                                diag_sample = (probe.float() * hv.float() * hvp_scale).reshape(-1, hv.shape[-1])
-                                if not torch.isfinite(diag_sample).all():
-                                    raise ValueError(
-                                        f"HNLL HVP produced non-finite curvature sample before Hessian build "
-                                        f"at layers {batch_layer_indices[0]}-{batch_layer_indices[-1]}, module {key}, "
-                                        f"probe={probe_idx}, hvp_scale={hvp_scale}. "
-                                        f"Try --nll_hvp_layer_chunk_size with a smaller contiguous chunk."
+                            if profile:
+                                _cuda_sync_if_profiled(device, profile)
+                                first_backward_time = time.perf_counter() - phase_start
+                                phase_start = time.perf_counter()
+
+                            for probe_idx in range(num_probes):
+                                probes = [_rademacher_like(z) for z in zs]
+                                hvp_seed = torch.stack([
+                                    (grad_z.float() * probe.float()).sum()
+                                    for grad_z, probe in zip(grad_zs, probes)
+                                ]).sum() / hvp_scale
+                                hvps = torch.autograd.grad(
+                                    hvp_seed,
+                                    zs,
+                                    retain_graph=probe_idx < num_probes - 1,
+                                    create_graph=False,
+                                    allow_unused=False,
+                                )
+                                for key, probe, hv in zip(module_keys, probes, hvps):
+                                    diag_sample = (probe.float() * hv.float() * hvp_scale).reshape(-1, hv.shape[-1])
+                                    if not torch.isfinite(diag_sample).all():
+                                        raise ValueError(
+                                            f"HNLL HVP produced non-finite curvature sample before Hessian build "
+                                            f"at layers {batch_layer_indices[0]}-{batch_layer_indices[-1]}, module {key}, "
+                                            f"probe={probe_idx}, hvp_scale={hvp_scale}. "
+                                            f"Try --nll_hvp_layer_chunk_size with a smaller contiguous chunk."
+                                        )
+                                    group_accums[key].add_(reduce_channels_by_group_mean(diag_sample, num_groups))
+                        else:
+                            if profile:
+                                first_backward_time = 0.0
+
+                            def _raise_missing_perturbations():
+                                missing_perturbed = [key for key in module_keys if key not in perturbed_captures]
+                                if missing_perturbed:
+                                    raise RuntimeError(f"HNLL finite-difference did not perturb target module outputs: {missing_perturbed}")
+
+                            def finite_diff_grads(probe_dict, sign):
+                                nonlocal perturbations, perturbed_captures
+                                captures.clear()
+                                perturbed_captures = {}
+                                perturbations = {
+                                    key: (sign * fd_epsilon * probe).to(device)
+                                    for key, probe in probe_dict.items()
+                                }
+                                try:
+                                    fd_outputs = model(**forward_kwargs)
+                                    fd_loss = fd_outputs.loss * valid_tokens
+                                    _raise_missing_perturbations()
+                                    fd_zs = [perturbed_captures[key] for key in module_keys]
+                                    grads = torch.autograd.grad(
+                                        fd_loss,
+                                        fd_zs,
+                                        create_graph=False,
+                                        retain_graph=False,
+                                        allow_unused=False,
                                     )
-                                group_accums[key].add_(reduce_channels_by_group_mean(diag_sample, num_groups))
+                                finally:
+                                    perturbations = None
+                                del fd_outputs, fd_loss
+                                return grads
+
+                            def finite_diff_grads_batched_signs(probe_dict):
+                                nonlocal perturbations, perturbed_captures
+                                captures.clear()
+                                perturbed_captures = {}
+                                perturbations = {
+                                    key: torch.cat((fd_epsilon * probe, -fd_epsilon * probe), dim=0).to(device)
+                                    for key, probe in probe_dict.items()
+                                }
+                                batched_forward_kwargs = {
+                                    "input_ids": torch.cat((tokens, tokens), dim=0),
+                                    "labels": torch.cat((labels, labels), dim=0),
+                                }
+                                if attention_mask is not None:
+                                    mask = forward_kwargs.get("attention_mask")
+                                    batched_forward_kwargs["attention_mask"] = torch.cat((mask, mask), dim=0)
+                                try:
+                                    fd_outputs = model(**batched_forward_kwargs)
+                                    fd_loss = fd_outputs.loss * (2 * valid_tokens)
+                                    _raise_missing_perturbations()
+                                    fd_zs = [perturbed_captures[key] for key in module_keys]
+                                    grads = torch.autograd.grad(
+                                        fd_loss,
+                                        fd_zs,
+                                        create_graph=False,
+                                        retain_graph=False,
+                                        allow_unused=False,
+                                    )
+                                finally:
+                                    perturbations = None
+                                del fd_outputs, fd_loss, batched_forward_kwargs
+                                grads_plus = []
+                                grads_minus = []
+                                for grad in grads:
+                                    grad_plus, grad_minus = grad.chunk(2, dim=0)
+                                    grads_plus.append(grad_plus)
+                                    grads_minus.append(grad_minus)
+                                return grads_plus, grads_minus
+
+                            zs = [z.detach() for z in zs]
+                            captures.clear()
+                            del outputs, loss_nll
+                            fd_batched_signs_active = fd_batched_signs
+                            for probe_idx in range(num_probes):
+                                probes = [_rademacher_like(z) for z in zs]
+                                probe_dict = {key: probe for key, probe in zip(module_keys, probes)}
+                                if fd_batched_signs_active:
+                                    try:
+                                        grads_plus, grads_minus = finite_diff_grads_batched_signs(probe_dict)
+                                    except RuntimeError as exc:
+                                        if device.type == "cuda" and "out of memory" in str(exc).lower():
+                                            logging.warning(
+                                                "HNLL finite-difference batched +/- signs hit CUDA OOM; "
+                                                "falling back to sequential +/- signs for this run."
+                                            )
+                                            torch.cuda.empty_cache()
+                                            fd_batched_signs_active = False
+                                            grads_plus = finite_diff_grads(probe_dict, 1.0)
+                                            grads_minus = finite_diff_grads(probe_dict, -1.0)
+                                        else:
+                                            raise
+                                else:
+                                    grads_plus = finite_diff_grads(probe_dict, 1.0)
+                                    grads_minus = finite_diff_grads(probe_dict, -1.0)
+                                for key, probe, grad_plus, grad_minus in zip(module_keys, probes, grads_plus, grads_minus):
+                                    hv = (grad_plus.float() - grad_minus.float()) / (2.0 * fd_epsilon)
+                                    diag_sample = (probe.float() * hv).reshape(-1, hv.shape[-1])
+                                    if not torch.isfinite(diag_sample).all():
+                                        raise ValueError(
+                                            f"HNLL finite-difference HVP produced non-finite curvature sample "
+                                            f"at layers {batch_layer_indices[0]}-{batch_layer_indices[-1]}, module {key}, "
+                                            f"probe={probe_idx}, epsilon={fd_epsilon}."
+                                        )
+                                    group_accums[key].add_(reduce_channels_by_group_mean(diag_sample, num_groups))
                         if profile:
                             _cuda_sync_if_profiled(device, profile)
                             hvp_time = time.perf_counter() - phase_start
                             phase_start = time.perf_counter()
+
+                        if hvp_engine == "autograd":
+                            del grad_zs, probes, hvp_seed, hvps
+                        else:
+                            del probes, probe_dict, grads_plus, grads_minus
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
 
                         sample_hessians = _build_hnll_sample_hessians(
                             module_keys,
@@ -1093,7 +1478,9 @@ def accumulate_nll_hvp_hessians(
                                 f"cuda_alloc={allocated_gb:.2f}GiB cuda_reserved={reserved_gb:.2f}GiB"
                             )
 
-                        del outputs, loss_nll, grad_zs, group_accums, probes, hvps, hvp_seed, sample_hessians
+                        for _name in ("outputs", "loss_nll", "grad_zs", "group_accums", "probes", "hvps", "hvp_seed", "sample_hessians", "grads_plus", "grads_minus"):
+                            if _name in locals():
+                                del locals()[_name]
                 finally:
                     for hook in hooks:
                         hook.remove()
@@ -1116,6 +1503,18 @@ def accumulate_nll_hvp_hessians(
 
     logging.info("Done accumulating HNLL HVP Hessians for all layers.")
     return False
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

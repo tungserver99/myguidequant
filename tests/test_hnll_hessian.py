@@ -1,7 +1,9 @@
-from pathlib import Path
+﻿from pathlib import Path
+import ast
 import importlib.util
 import sys
 import types
+import tempfile
 
 import torch
 import transformers
@@ -15,6 +17,7 @@ def _load_activations():
     quantization_pkg = types.ModuleType("any_precision.quantization")
     quantization_pkg.__path__ = [str(repo_root / "any_precision" / "quantization")]
     analyzer_pkg = types.ModuleType("any_precision.analyzer")
+    analyzer_pkg.get_analyzer = lambda *args, **kwargs: None
     analyzer_mod = types.ModuleType("any_precision.analyzer.analyzer")
     analyzer_mod.ModelAnalyzer = object
 
@@ -42,6 +45,7 @@ build_group_hessians_legacy = activations.build_group_hessians_legacy
 build_group_hessians_batched = activations.build_group_hessians_batched
 build_shared_x_group_hessians = activations.build_shared_x_group_hessians
 reduce_channels_by_group_mean = activations.reduce_channels_by_group_mean
+accumulate_nll_ggn_hessians = activations.accumulate_nll_ggn_hessians
 _prepare_hnll_tokens_and_labels = activations._prepare_hnll_tokens_and_labels
 
 
@@ -160,11 +164,133 @@ def test_batched_builder_rejects_negative_stats():
         assert "negative stats" in str(exc)
     else:
         raise AssertionError("Expected negative stats to be rejected")
+
+def test_accumulate_nll_ggn_hessians_runs_toy_lm():
+    class Output:
+        def __init__(self, logits):
+            self.logits = logits
+            self.loss = logits.sum() * 0.0
+
+    class ToyLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 3, bias=False)
+            with torch.no_grad():
+                self.linear.weight.copy_(torch.tensor([[0.2], [0.4], [0.6]]))
+
+        def forward(self, x):
+            return self.linear(x)
+
+    class ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(use_cache=True)
+            self.layers = torch.nn.ModuleList([ToyLayer()])
+
+        def forward(self, input_ids, labels=None, attention_mask=None):
+            x = input_ids.float().unsqueeze(-1)
+            logits = self.layers[0](x)
+            return Output(logits)
+
+    class ToyAnalyzer:
+        def __init__(self):
+            self.model = ToyModel()
+            self.tokenizer = types.SimpleNamespace(pad_token_id=None)
+
+        def get_layers(self):
+            return list(self.model.layers)
+
+        def get_modules(self, layer):
+            return {"linear": layer.linear}
+
+    analyzer = ToyAnalyzer()
+    data = [torch.tensor([[0, 1, 2]])]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        accumulate_nll_ggn_hessians(
+            analyzer,
+            data,
+            tmpdir,
+            num_groups=1,
+            num_probes=2,
+            random_state=0,
+            hessian_builder="batched",
+            hessian_group_chunk_size=1,
+            curvature_dtype="current",
+        )
+        saved = torch.load(Path(tmpdir) / "l0.pt", map_location="cpu", weights_only=True)
+
+    assert "linear" in saved
+    hessian = saved["linear"]
+    assert hessian.shape == (1, 1, 1)
+    assert torch.isfinite(hessian).all()
+    assert hessian.item() >= 0
+
+def test_accumulate_nll_hvp_hessians_finite_diff_runs_toy_model():
+    class Output:
+        def __init__(self, loss):
+            self.loss = loss
+
+    class ToyLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 2, bias=False)
+            with torch.no_grad():
+                self.linear.weight.copy_(torch.tensor([[1.0], [2.0]]))
+
+        def forward(self, x):
+            return self.linear(x)
+
+    class ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(use_cache=True)
+            self.layers = torch.nn.ModuleList([ToyLayer()])
+
+        def forward(self, input_ids, labels=None, attention_mask=None):
+            x = input_ids.float().unsqueeze(-1)
+            out = self.layers[0](x)
+            return Output(out.pow(2).sum())
+
+    class ToyAnalyzer:
+        def __init__(self):
+            self.model = ToyModel()
+            self.tokenizer = types.SimpleNamespace(pad_token_id=None)
+
+        def get_layers(self):
+            return list(self.model.layers)
+
+        def get_modules(self, layer):
+            return {"linear": layer.linear}
+
+    analyzer = ToyAnalyzer()
+    data = [torch.tensor([[1, 2, 3]])]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        activations.accumulate_nll_hvp_hessians(
+            analyzer,
+            data,
+            tmpdir,
+            num_groups=1,
+            num_probes=1,
+            random_state=0,
+            hessian_builder="batched",
+            hessian_group_chunk_size=1,
+            hvp_engine="finite_diff",
+            fd_epsilon=1e-3,
+            sdpa_backend="math",
+        )
+        saved = torch.load(Path(tmpdir) / "l0.pt", map_location="cpu", weights_only=True)
+
+    assert "linear" in saved
+    hessian = saved["linear"]
+    assert hessian.shape == (1, 1, 1)
+    assert torch.isfinite(hessian).all()
+    assert hessian.item() > 0
 def test_layerwise_cli_exposes_hnll_hvp_flags():
     text = Path("layerwise_nuq.py").read_text()
 
     assert "--hessian_source" in text
     assert "nll_hvp" in text
+    assert "nll_ggn" in text
     assert "--nll_hvp_probes" in text
     assert "--nll_hvp_layer_chunk_size" in text
     assert "--nll_hvp_profile" in text
@@ -173,6 +299,35 @@ def test_layerwise_cli_exposes_hnll_hvp_flags():
     assert "--nll_hessian_group_chunk_size" in text
     assert "--nll_hessian_validate_shared_x" in text
     assert "--nll_hvp_sdpa_backend" in text
+    assert "--nll_hvp_engine" in text
+    assert "--nll_hvp_fd_epsilon" in text
+    assert "--nll_hvp_fd_batched_signs" in text
+
+
+def test_layerwise_main_accepts_hnll_finite_diff_cli_kwargs():
+    tree = ast.parse(Path("any_precision/quantization/layerwise_main.py").read_text(encoding="utf-8-sig"))
+    layerwise_func = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "layerwise_nuq"
+    )
+    params = {arg.arg for arg in layerwise_func.args.args}
+
+    assert "nll_hvp_engine" in params
+    assert "nll_hvp_fd_epsilon" in params
+    assert "nll_hvp_fd_batched_signs" in params
+
+def test_layerwise_main_forwards_hnll_finite_diff_kwargs_to_accumulator():
+    tree = ast.parse(Path("any_precision/quantization/layerwise_main.py").read_text(encoding="utf-8-sig"))
+    call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "accumulate_nll_hvp_hessians"
+    )
+    keywords = {keyword.arg for keyword in call.keywords}
+
+    assert "hvp_engine" in keywords
+    assert "fd_epsilon" in keywords
+    assert "fd_batched_signs" in keywords
 
 
 
