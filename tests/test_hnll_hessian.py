@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 import ast
 import importlib.util
 import sys
@@ -44,6 +44,7 @@ build_group_hessians_from_curvature = activations.build_group_hessians_from_curv
 build_group_hessians_legacy = activations.build_group_hessians_legacy
 build_group_hessians_batched = activations.build_group_hessians_batched
 build_shared_x_group_hessians = activations.build_shared_x_group_hessians
+build_fd_shared_x_buffer_hessians = activations.build_fd_shared_x_buffer_hessians
 reduce_channels_by_group_mean = activations.reduce_channels_by_group_mean
 accumulate_nll_ggn_hessians = activations.accumulate_nll_ggn_hessians
 accumulate_fast_hnll_base_residual_hvp_hessians = activations.accumulate_fast_hnll_base_residual_hvp_hessians
@@ -155,6 +156,55 @@ def test_shared_x_group_hessians_match_separate_builds_with_unequal_groups():
         expected = build_group_hessians_batched(x, stats, group_chunk_size=2)
         torch.testing.assert_close(fused[module_name].double(), expected.double(), rtol=1e-5, atol=1e-5)
 
+
+
+
+def test_fd_shared_x_buffer_hessians_match_full_concat_without_duplicate_x():
+    module_keys = [
+        (0, "self_attn.q_proj"),
+        (0, "self_attn.k_proj"),
+        (0, "mlp.down_proj"),
+    ]
+    sample_xs = [
+        {
+            module_keys[0]: torch.randn(3, 4),
+            module_keys[1]: None,
+            module_keys[2]: torch.randn(3, 4),
+        },
+        {
+            module_keys[0]: torch.randn(2, 4),
+            module_keys[1]: None,
+            module_keys[2]: torch.randn(2, 4),
+        },
+    ]
+    sample_xs[0][module_keys[1]] = sample_xs[0][module_keys[0]]
+    sample_xs[1][module_keys[1]] = sample_xs[1][module_keys[0]]
+    sample_stats = [
+        {key: torch.rand(3, 2) for key in module_keys},
+        {key: torch.rand(2, 2) for key in module_keys},
+    ]
+
+    buffered = activations.create_fd_shared_x_buffer(module_keys)
+    for xs_by_key, stats_by_key in zip(sample_xs, sample_stats):
+        activations.append_fd_shared_x_buffer(buffered, module_keys, xs_by_key, stats_by_key)
+
+    actual = build_fd_shared_x_buffer_hessians(
+        buffered,
+        builder="batched_shared_x",
+        group_chunk_size=2,
+        validate_shared_x=False,
+        device=torch.device("cpu"),
+    )
+
+    for key in module_keys:
+        x_all = torch.cat([sample[key] for sample in sample_xs], dim=0)
+        stats_all = torch.cat([sample[key] for sample in sample_stats], dim=0)
+        expected = build_group_hessians_batched(x_all, stats_all.clamp_min(0), group_chunk_size=2)
+        torch.testing.assert_close(actual[key].double(), expected.double(), rtol=1e-5, atol=1e-5)
+
+    q_shared_id = activations._shared_x_semantic_id(*module_keys[0])
+    assert len(buffered["x_buffers"]) == 2
+    assert len(buffered["x_buffers"][q_shared_id]) == 2
 
 def test_batched_builder_rejects_negative_stats():
     x = torch.randn(3, 2)
@@ -417,6 +467,7 @@ def test_accumulate_nll_hvp_hessians_finite_diff_runs_toy_model():
     assert hessian.shape == (1, 1, 1)
     assert torch.isfinite(hessian).all()
     assert hessian.item() > 0
+
 def test_layerwise_cli_exposes_hnll_hvp_flags():
     text = Path("layerwise_nuq.py").read_text()
 
@@ -456,6 +507,7 @@ def test_layerwise_main_accepts_hnll_finite_diff_cli_kwargs():
     assert "fd_scale_mode" in params
     assert "fd_scale_multiplier" in params
     assert "fd_build_flush_interval" in params
+    assert "overwrite_hessians" in params
 
 def test_layerwise_main_forwards_hnll_finite_diff_kwargs_to_accumulator():
     tree = ast.parse(Path("any_precision/quantization/layerwise_main.py").read_text(encoding="utf-8-sig"))
@@ -470,7 +522,18 @@ def test_layerwise_main_forwards_hnll_finite_diff_kwargs_to_accumulator():
     assert "fd_epsilon" in keywords
     assert "fd_batched_signs" in keywords
 
+def test_layerwise_cli_and_fd_grouptrace_script_expose_hessian_overwrite():
+    cli_text = Path("layerwise_nuq.py").read_text()
+    script_text = Path(
+        "scripts/run_lnq_guidedquant_fd_grouptrace_cd_llama2_7b_c4_eval_ppl.sh"
+    ).read_text()
 
+    assert "--overwrite_hessians" in cli_text
+    assert "hessian_overwrite_args" in script_text
+    assert "--overwrite_hessians" in script_text
 
+def test_layerwise_main_removes_hessian_cache_when_overwrite_hessians_is_set():
+    text = Path("any_precision/quantization/layerwise_main.py").read_text(encoding="utf-8-sig")
 
-
+    assert "overwrite_hessians and os.path.exists(hessians_cache_path)" in text
+    assert "shutil.rmtree(hessians_cache_path)" in text

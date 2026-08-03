@@ -32,6 +32,7 @@ def layerwise_nuq(
         overwrite_tokens=False,
         overwrite_quantize=False,
         overwrite_pack=False,
+        overwrite_hessians=False,
         random_state=None,
         num_groups=None,
         num_iterations=3,
@@ -140,6 +141,7 @@ def layerwise_nuq(
     logging.info(f"Hessians cache path: {hessians_cache_path}")
     logging.info(f"Quantized cache path: {quantized_cache_path}")
     logging.info(f"Model output path: {model_output_path}")
+    logging.info(f"Overwrite hessians: {overwrite_hessians}")
     logging.info(f"Hessian source: {hessian_source}")
     logging.info(f"NLL HVP probes: {nll_hvp_probes}")
     logging.info(f"NLL HVP layer chunk size: {nll_hvp_layer_chunk_size}")
@@ -207,6 +209,9 @@ def layerwise_nuq(
     
     # ------------------- Get Hessians -------------------
     logging.info("------------------- Get Hessians -------------------")
+    if overwrite_hessians and os.path.exists(hessians_cache_path):
+        logging.info(f"Detected cached Hessians at {hessians_cache_path}. Will delete and recalculate.")
+        shutil.rmtree(hessians_cache_path)
     logging.info(f"Getting Hessians for {dataset} with sequence length {seq_len} and {num_examples} examples")
     if hessian_source == "nll_hvp":
         from_cache = accumulate_nll_hvp_hessians(

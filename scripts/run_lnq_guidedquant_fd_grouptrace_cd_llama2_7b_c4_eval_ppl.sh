@@ -27,10 +27,10 @@ EVAL_DTYPE="${EVAL_DTYPE:-fp16}"
 ASSIGNMENT_SOLVER="cd"
 FD_NUM_PROBES="${FD_NUM_PROBES:-1}"
 FD_LAYER_CHUNK_SIZE="${FD_LAYER_CHUNK_SIZE:-0}"
-FD_EXECUTION_MODE="${FD_EXECUTION_MODE:-sequential}"
+FD_EXECUTION_MODE="${FD_EXECUTION_MODE:-paired_batch}"
 FD_SCALE_MODE="${FD_SCALE_MODE:-activation_rms}"
 FD_SCALE_MULTIPLIER="${FD_SCALE_MULTIPLIER:-0.01}"
-FD_BUILD_FLUSH_INTERVAL="${FD_BUILD_FLUSH_INTERVAL:-4}"
+FD_BUILD_FLUSH_INTERVAL="${FD_BUILD_FLUSH_INTERVAL:-8}"
 NLL_FD_PROFILE="${NLL_FD_PROFILE:-0}"
 NLL_FD_DTYPE="${NLL_FD_DTYPE:-auto}"
 NLL_HESSIAN_BUILDER="batched_shared_x"
@@ -61,6 +61,7 @@ QUANT_LOG_DIR="logs_layer"
 
 quantize_overwrite_args=()
 layerwise_overwrite_args=()
+hessian_overwrite_args=()
 fd_profile_args=()
 fd_validate_shared_x_args=()
 if [[ "${NLL_FD_PROFILE}" == "1" || "${NLL_FD_PROFILE}" == "true" ]]; then
@@ -72,6 +73,7 @@ fi
 if [[ "${OVERWRITE}" == "1" || "${OVERWRITE}" == "true" ]]; then
   quantize_overwrite_args=(--overwrite_tokens --overwrite_gradients --overwrite_quantize --overwrite_pack)
   layerwise_overwrite_args=(--overwrite_quantize --overwrite_pack)
+  hessian_overwrite_args=(--overwrite_hessians)
 fi
 
 if [[ -d "${PACKED_MODEL_DIR}" ]] && ! has_packed_model "${PACKED_MODEL_DIR}"; then
@@ -114,6 +116,7 @@ python layerwise_nuq.py "${MODEL_NAME}" \
   --random_state "${RANDOM_STATE}" \
   "${fd_profile_args[@]}" \
   "${fd_validate_shared_x_args[@]}" \
+  "${hessian_overwrite_args[@]}" \
   "${layerwise_overwrite_args[@]}"
 
 latest_quant_log="$(ls -t "${QUANT_LOG_DIR}"/*.txt 2>/dev/null | head -n 1 || true)"

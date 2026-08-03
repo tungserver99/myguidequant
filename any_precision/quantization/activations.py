@@ -853,6 +853,120 @@ def _build_hnll_sample_hessians(
 
     return hessians
 
+
+
+def create_fd_shared_x_buffer(module_keys):
+    """Create a CPU staging buffer keyed by shared activation identity.
+
+    FD GroupTrace uses identical input activations for q/k/v and gate/up within a
+    layer. Buffering X once per shared id avoids duplicating large CPU tensors
+    while retaining separate group statistics per target module.
+    """
+    shared_keys = {}
+    for key in module_keys:
+        shared_id = _shared_x_semantic_id(*key)
+        shared_keys.setdefault(shared_id, []).append(key)
+    return {
+        "shared_keys": shared_keys,
+        "x_buffers": {shared_id: [] for shared_id in shared_keys},
+        "stats_buffers": {key: [] for key in module_keys},
+    }
+
+
+def append_fd_shared_x_buffer(buffer, module_keys, xs_by_key, stats_by_key, validate_shared_x: bool = False):
+    for shared_id, keys in buffer["shared_keys"].items():
+        base_x = xs_by_key[keys[0]].detach().reshape(-1, xs_by_key[keys[0]].shape[-1]).cpu()
+        if validate_shared_x and len(keys) > 1:
+            for key in keys[1:]:
+                other_x = xs_by_key[key].detach().reshape(-1, xs_by_key[key].shape[-1]).cpu()
+                if base_x.shape != other_x.shape or not torch.equal(base_x, other_x):
+                    logging.warning(f"HNLL FD shared-X validation failed for {shared_id}; storing first X only for memory efficiency")
+                    break
+        buffer["x_buffers"][shared_id].append(base_x)
+        for key in keys:
+            buffer["stats_buffers"][key].append(stats_by_key[key].detach().cpu())
+
+
+def build_fd_shared_x_buffer_hessians(
+    buffer,
+    builder: str,
+    group_chunk_size: int,
+    validate_shared_x: bool,
+    device: torch.device,
+):
+    hessians = {}
+    for shared_id, keys in buffer["shared_keys"].items():
+        if not buffer["x_buffers"][shared_id]:
+            continue
+        x_all = torch.cat(buffer["x_buffers"][shared_id], dim=0).to(device)
+        module_group_stats = {
+            key: torch.cat(buffer["stats_buffers"][key], dim=0).clamp_min(0.0).to(device)
+            for key in keys
+        }
+        if builder == "batched_shared_x" and len(keys) > 1:
+            built = build_shared_x_group_hessians(
+                x_all,
+                {key: module_group_stats[key] for key in keys},
+                group_chunk_size,
+            )
+            for key, hessian in built.items():
+                hessians[key] = hessian.detach().cpu()
+        else:
+            for key in keys:
+                hessians[key] = _build_hnll_sample_hessians(
+                    [key],
+                    [x_all],
+                    {key: module_group_stats[key]},
+                    1,
+                    builder,
+                    group_chunk_size,
+                    validate_shared_x,
+                )[key]
+        del x_all, module_group_stats
+    return hessians
+
+
+
+def build_fd_shared_x_buffer_layer_hessians(
+    buffer,
+    layer_idx: int,
+    builder: str,
+    group_chunk_size: int,
+    validate_shared_x: bool,
+    device: torch.device,
+):
+    hessians = {}
+    for shared_id, keys in buffer["shared_keys"].items():
+        if shared_id[0] != layer_idx or not buffer["x_buffers"][shared_id]:
+            continue
+        x_all = torch.cat(buffer["x_buffers"][shared_id], dim=0).to(device)
+        module_group_stats = {
+            key: torch.cat(buffer["stats_buffers"][key], dim=0).clamp_min(0.0).to(device)
+            for key in keys
+        }
+        if builder == "batched_shared_x" and len(keys) > 1:
+            built = build_shared_x_group_hessians(
+                x_all,
+                {key: module_group_stats[key] for key in keys},
+                group_chunk_size,
+            )
+            for key, hessian in built.items():
+                hessians[key] = hessian.detach().cpu()
+            del built
+        else:
+            for key in keys:
+                hessians[key] = _build_hnll_sample_hessians(
+                    [key],
+                    [x_all],
+                    {key: module_group_stats[key]},
+                    1,
+                    builder,
+                    group_chunk_size,
+                    validate_shared_x,
+                )[key]
+        del x_all, module_group_stats
+    return hessians
+
 def accumulate_fast_hnll_base_residual_hvp_hessians(
     analyzer,
     data: List[torch.Tensor],
@@ -1538,15 +1652,30 @@ def accumulate_nll_hvp_hessians(
                     continue
 
                 batch_modules = {layer_idx: analyzer.get_modules(layers[layer_idx]) for layer_idx in batch_layer_indices}
-                results = {
-                    layer_idx: {
-                        name: torch.zeros(num_groups, module.weight.shape[1], module.weight.shape[1], dtype=torch.float32)
-                        for name, module in modules.items()
+                stream_fd_results = False
+                if stream_fd_results:
+                    results = None
+                    partial_result_paths = {
+                        layer_idx: os.path.join(output_folder, f"l{layer_idx}.partial.pt")
+                        for layer_idx in batch_layer_indices
                     }
+                    for partial_path in partial_result_paths.values():
+                        if os.path.exists(partial_path):
+                            os.remove(partial_path)
+                else:
+                    results = {
+                        layer_idx: {
+                            name: torch.zeros(num_groups, module.weight.shape[1], module.weight.shape[1], dtype=torch.float32)
+                            for name, module in modules.items()
+                        }
+                        for layer_idx, modules in batch_modules.items()
+                    }
+                fd_module_keys = [
+                    (layer_idx, module_name)
                     for layer_idx, modules in batch_modules.items()
-                }
-                raw_xs = {layer_idx: {name: [] for name in modules.keys()} for layer_idx, modules in batch_modules.items()}
-                raw_group_stats = {layer_idx: {name: [] for name in modules.keys()} for layer_idx, modules in batch_modules.items()}
+                    for module_name in modules.keys()
+                ]
+                fd_buffer = create_fd_shared_x_buffer(fd_module_keys)
                 valid_tokens_total = 0
                 hooks = []
                 captures = {}
@@ -1576,27 +1705,53 @@ def accumulate_nll_hvp_hessians(
                         hooks.append(module.register_forward_hook(make_hook(layer_idx, module_name)))
 
                 def flush_fd_buffer():
-                    for layer_idx in batch_layer_indices:
-                        for module_name in batch_modules[layer_idx].keys():
-                            if not raw_xs[layer_idx][module_name]:
-                                continue
-                            x_all = torch.cat(raw_xs[layer_idx][module_name], dim=0).to(device)
-                            stats_all = torch.cat(raw_group_stats[layer_idx][module_name], dim=0).to(device)
-                            hessian = _build_hnll_sample_hessians(
-                                [(layer_idx, module_name)],
-                                [x_all],
-                                {(layer_idx, module_name): stats_all},
-                                1,
+                    if stream_fd_results:
+                        for layer_idx in batch_layer_indices:
+                            layer_updates = build_fd_shared_x_buffer_layer_hessians(
+                                fd_buffer,
+                                layer_idx,
                                 hessian_builder,
                                 hessian_group_chunk_size,
                                 validate_shared_x,
-                            )[(layer_idx, module_name)]
+                                device,
+                            )
+                            if not layer_updates:
+                                continue
+                            partial_path = partial_result_paths[layer_idx]
+                            if os.path.exists(partial_path):
+                                layer_result = torch.load(partial_path, map_location="cpu", weights_only=True)
+                            else:
+                                layer_result = {
+                                    name: torch.zeros(num_groups, module.weight.shape[1], module.weight.shape[1], dtype=torch.float32)
+                                    for name, module in batch_modules[layer_idx].items()
+                                }
+                            for key, hessian in layer_updates.items():
+                                update_layer_idx, module_name = key
+                                if not torch.isfinite(hessian).all():
+                                    raise ValueError(f"HNLL FD GroupTrace H contains non-finite values at layer {update_layer_idx}, module {module_name}")
+                                layer_result[module_name].add_(hessian.detach().cpu())
+                            torch.save(layer_result, partial_path)
+                            del layer_result, layer_updates
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                    else:
+                        built_hessians = build_fd_shared_x_buffer_hessians(
+                            fd_buffer,
+                            hessian_builder,
+                            hessian_group_chunk_size,
+                            validate_shared_x,
+                            device,
+                        )
+                        for key, hessian in built_hessians.items():
+                            layer_idx, module_name = key
                             if not torch.isfinite(hessian).all():
                                 raise ValueError(f"HNLL FD GroupTrace H contains non-finite values at layer {layer_idx}, module {module_name}")
                             results[layer_idx][module_name].add_(hessian.detach().cpu())
-                            raw_xs[layer_idx][module_name].clear()
-                            raw_group_stats[layer_idx][module_name].clear()
-                            del x_all, stats_all, hessian
+                        del built_hessians
+                    for shared_buffers in fd_buffer["x_buffers"].values():
+                        shared_buffers.clear()
+                    for stats_buffers in fd_buffer["stats_buffers"].values():
+                        stats_buffers.clear()
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
 
@@ -1670,7 +1825,7 @@ def accumulate_nll_hvp_hessians(
                                 phase_start = time.perf_counter()
 
                             for probe_idx in range(num_probes):
-                                probes = [_rademacher_like(z) for z in zs]
+                                probes = [torch.empty(shape, device=probe_device, dtype=probe_dtype).bernoulli_(0.5).mul_(2.0).sub_(1.0) for shape, probe_device, probe_dtype in z_specs]
                                 hvp_seed = torch.stack([
                                     (grad_z.float() * probe.float()).sum()
                                     for grad_z, probe in zip(grad_zs, probes)
@@ -1764,12 +1919,26 @@ def accumulate_nll_hvp_hessians(
                                     grads_minus.append(grad_minus)
                                 return grads_plus, grads_minus
 
-                            zs = [z.detach() for z in zs]
-                            captures.clear()
-                            del outputs, loss_nll
+                            if fd_build_after_calibration:
+                                xs_by_key_cpu = {
+                                    key: x.detach().reshape(-1, x.shape[-1]).cpu()
+                                    for key, x in zip(module_keys, xs)
+                                }
+                                z_specs = [(tuple(z.shape), z.device, z.dtype) for z in zs]
+                                captures.clear()
+                                del outputs, loss_nll, xs, zs
+                                if device.type == "cuda":
+                                    torch.cuda.empty_cache()
+                            else:
+                                zs = [z.detach() for z in zs]
+                                captures.clear()
+                                del outputs, loss_nll
                             fd_batched_signs_active = fd_batched_signs or fd_execution_mode == "paired_batch"
                             for probe_idx in range(num_probes):
-                                probes = [_rademacher_like(z) for z in zs]
+                                if fd_build_after_calibration:
+                                    probes = [torch.empty(shape, device=probe_device, dtype=probe_dtype).bernoulli_(0.5).mul_(2.0).sub_(1.0) for shape, probe_device, probe_dtype in z_specs]
+                                else:
+                                    probes = [_rademacher_like(z) for z in zs]
                                 probe_dict = {key: probe for key, probe in zip(module_keys, probes)}
                                 if fd_batched_signs_active:
                                     try:
@@ -1815,10 +1984,13 @@ def accumulate_nll_hvp_hessians(
                             torch.cuda.empty_cache()
 
                         if fd_build_after_calibration and hvp_engine == "finite_diff":
-                            for key, x, z in zip(module_keys, xs, zs):
-                                layer_idx, module_name = key
-                                raw_xs[layer_idx][module_name].append(x.detach().reshape(-1, x.shape[-1]).cpu())
-                                raw_group_stats[layer_idx][module_name].append(group_accums[key].div(float(num_probes)).detach().cpu())
+                            append_fd_shared_x_buffer(
+                                fd_buffer,
+                                module_keys,
+                                xs_by_key_cpu,
+                                {key: group_accums[key].div(float(num_probes)) for key in module_keys},
+                                validate_shared_x,
+                            )
                             if fd_build_flush_interval > 0 and (sample_idx + 1) % fd_build_flush_interval == 0:
                                 flush_fd_buffer()
                             sample_hessians = None
@@ -1864,13 +2036,26 @@ def accumulate_nll_hvp_hessians(
 
                 for layer_idx in batch_layer_indices:
                     out_file = os.path.join(output_folder, f"l{layer_idx}.pt")
-                    for module_name, hessian in results[layer_idx].items():
-                        _log_hnll_hessian_stats(layer_idx, module_name, hessian, num_probes, valid_tokens_total)
-                    torch.save(results[layer_idx], out_file)
+                    if stream_fd_results:
+                        partial_path = partial_result_paths[layer_idx]
+                        if not os.path.exists(partial_path):
+                            raise RuntimeError(f"HNLL FD partial Hessian missing for layer {layer_idx}: {partial_path}")
+                        layer_result = torch.load(partial_path, map_location="cpu", weights_only=True)
+                        for module_name, hessian in layer_result.items():
+                            _log_hnll_hessian_stats(layer_idx, module_name, hessian, num_probes, valid_tokens_total)
+                        torch.save(layer_result, out_file)
+                        os.remove(partial_path)
+                        del layer_result
+                    else:
+                        for module_name, hessian in results[layer_idx].items():
+                            _log_hnll_hessian_stats(layer_idx, module_name, hessian, num_probes, valid_tokens_total)
+                        torch.save(results[layer_idx], out_file)
                     logging.info(f"[Layer {layer_idx}] Saved HNLL HVP Hessians to {out_file}")
                     pb.update(1)
-                del results
-                torch.cuda.empty_cache()
+                if results is not None:
+                    del results
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
     finally:
         pb.close()
         if old_use_cache is not None:
