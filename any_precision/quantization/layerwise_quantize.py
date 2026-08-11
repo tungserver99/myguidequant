@@ -126,6 +126,143 @@ def update_P(
 
     return assignments
 
+
+def _gather_codewords(C: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return torch.gather(
+        C.unsqueeze(1).expand(-1, labels.shape[1], -1),
+        dim=2,
+        index=labels.unsqueeze(-1).long(),
+    ).squeeze(-1)
+
+def update_P_rbvt(
+    W: torch.Tensor,  # Shape: (output_dim, input_dim)
+    H: torch.Tensor,  # Shape: (num_groups, input_dim, input_dim)
+    labels: torch.Tensor,  # Shape: (output_dim, input_dim)
+    C: torch.Tensor,  # Shape: (output_dim, n_cluster)
+    rbvt_cycles: int,
+    beam_width: int = 8,
+    row_batch_size: int = 64,
+    verbose: bool = True,
+):
+    device = W.device
+    C = C.to(device)
+    H = H.to(device)
+    assignments_prev = labels.to(device).long()
+    assignments = assignments_prev.clone()
+
+    output_dim, d = assignments.shape
+    num_groups = H.shape[0]
+    assert output_dim % num_groups == 0
+    group_size = output_dim // num_groups
+    n_cluster = C.shape[-1]
+    beam_width = max(1, int(beam_width))
+    row_batch_size = max(1, int(row_batch_size))
+
+    pb = get_progress_bar(rbvt_cycles * d * num_groups, "Updating P inside RBVT")
+    start_time = time.time()
+
+    for cycle in range(rbvt_cycles):
+        cycle_start = assignments.clone()
+
+        for group_idx in range(num_groups):
+            row0 = group_idx * group_size
+            row1 = (group_idx + 1) * group_size
+            H_g = H[group_idx]
+            H_diag = torch.diagonal(H_g)
+
+            for st_idx in range(row0, row1, row_batch_size):
+                end_idx = min(st_idx + row_batch_size, row1)
+                W_batch = W[st_idx:end_idx]
+                C_batch = C[st_idx:end_idx]
+                labels_start = cycle_start[st_idx:end_idx]
+                row_count = W_batch.shape[0]
+
+                q_start = _gather_codewords(C_batch, labels_start)
+                E = q_start - W_batch
+                residual = E @ H_g
+                beam_obj = (E * residual).sum(dim=-1, keepdim=True)
+                residual_future = residual[:, None, :]
+                active_beam = 1
+
+                parent_history = torch.zeros(
+                    (row_count, d, beam_width),
+                    dtype=torch.long,
+                    device=device,
+                )
+                code_history = torch.zeros(
+                    (row_count, d, beam_width),
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                for i in range(d):
+                    delta = C_batch - q_start[:, i:i + 1]
+                    r_i = residual_future[..., 0]
+                    scores = (
+                        beam_obj[:, :, None]
+                        + 2.0 * r_i[:, :, None] * delta[:, None, :]
+                        + H_diag[i] * delta[:, None, :].square()
+                    )
+                    flat_scores = scores.reshape(row_count, active_beam * n_cluster)
+                    next_beam = min(beam_width, active_beam * n_cluster)
+                    new_obj, flat_idx = torch.topk(
+                        flat_scores,
+                        k=next_beam,
+                        dim=-1,
+                        largest=False,
+                        sorted=True,
+                    )
+
+                    parent_idx = flat_idx // n_cluster
+                    code_idx = flat_idx % n_cluster
+                    selected_delta = torch.gather(delta, dim=1, index=code_idx)
+
+                    parent_history[:, i, :next_beam] = parent_idx
+                    code_history[:, i, :next_beam] = code_idx
+
+                    if i + 1 < d:
+                        tail = residual_future[..., 1:]
+                        gather_idx = parent_idx[..., None].expand(
+                            -1, -1, tail.shape[-1]
+                        )
+                        selected_tail = torch.gather(tail, dim=1, index=gather_idx)
+                        residual_future = (
+                            selected_tail
+                            + selected_delta[..., None] * H_g[i, i + 1:][None, None, :]
+                        )
+                    else:
+                        residual_future = None
+
+                    beam_obj = new_obj
+                    active_beam = next_beam
+
+                row_ids = torch.arange(row_count, device=device)
+                best_beam = beam_obj.argmin(dim=-1)
+                best_labels = torch.empty(
+                    (row_count, d),
+                    dtype=torch.long,
+                    device=device,
+                )
+                for i in range(d - 1, -1, -1):
+                    best_labels[:, i] = code_history[row_ids, i, best_beam]
+                    best_beam = parent_history[row_ids, i, best_beam]
+
+                assignments[st_idx:end_idx] = best_labels
+
+            pb.update(d)
+
+    pb.close()
+
+    num_changed = (assignments_prev != assignments).sum().item()
+    total_assignments = assignments_prev.numel()
+    percentage_changed = num_changed / total_assignments * 100
+    if verbose:
+        logging.info(f"RBVT assignment_solver=rbvt beam_width={beam_width} rbvt_cycles={rbvt_cycles} row_batch_size={row_batch_size}")
+        logging.info(f"Percentage of assignments changed: {percentage_changed:.2f}%")
+        logging.info(f"RBVT update_P time: {time.time() - start_time:.2f} sec")
+
+    return assignments
+
 def update_C(
     W: torch.Tensor, # Shape: (output_dim, input_dim)
     H: torch.Tensor, # Shape: (num_groups, input_dim, input_dim)
@@ -214,6 +351,9 @@ def train_least_squares(
     H: np.ndarray, # Shape: (num_groups, input_dim, input_dim)
     num_iterations: int = 3,
     cd_cycles: int = 4,
+    assignment_solver: str = "cd",
+    beam_width: int = 8,
+    row_batch_size: int = 64,
 ) -> Tuple[np.ndarray, np.ndarray]:
     device = torch.device("cuda")
 
@@ -253,7 +393,20 @@ def train_least_squares(
 
         ######### Update P #########
         if iteration > 0:
-            labels = update_P(W, H, labels, C, cd_cycles=cd_cycles)
+            if assignment_solver == "cd":
+                labels = update_P(W, H, labels, C, cd_cycles=cd_cycles)
+            elif assignment_solver == "rbvt":
+                labels = update_P_rbvt(
+                    W,
+                    H,
+                    labels,
+                    C,
+                    rbvt_cycles=cd_cycles,
+                    beam_width=beam_width,
+                    row_batch_size=row_batch_size,
+                )
+            else:
+                raise ValueError(f"Unknown assignment_solver: {assignment_solver}")
 
         # Compute objective value for logging
         obj_value = objective_function(W, H, labels, C).item()
@@ -307,6 +460,9 @@ def seed_layer(
     group_count: int,
     num_iterations: int = 3,
     cd_cycles: int = 4,
+    assignment_solver: str = "cd",
+    beam_width: int = 8,
+    row_batch_size: int = 64,
 ) -> Tuple[List[List[np.ndarray]], List[np.ndarray]]:
     lut_by_bit_by_module = []
     parent_weights_by_modules = []
@@ -338,7 +494,17 @@ def seed_layer(
         init_centroids = module_init_centroids.reshape(output_dim, n_cluster) # Shape: (output_dim, n_cluster)
         reshaped_module_weight = module_weight.reshape(output_dim, input_dim) # Shape: (output_dim, input_dim)
 
-        labels, C, log_dict = train_least_squares(reshaped_module_weight, init_labels, init_centroids, module_hessian, num_iterations=num_iterations, cd_cycles=cd_cycles)
+        labels, C, log_dict = train_least_squares(
+            reshaped_module_weight,
+            init_labels,
+            init_centroids,
+            module_hessian,
+            num_iterations=num_iterations,
+            cd_cycles=cd_cycles,
+            assignment_solver=assignment_solver,
+            beam_width=beam_width,
+            row_batch_size=row_batch_size,
+        )
 
         labels = labels.astype(np.uint8) # Shape: (output_dim, input_dim)
         labels = labels.reshape(output_dim, 1, input_dim) # Shape: (output_dim, 1, input_dim)
@@ -475,6 +641,9 @@ def seed(
     cpu_count: int = None,
     num_iterations: int = 3,
     cd_cycles: int = 4,
+    assignment_solver: str = "cd",
+    beam_width: int = 8,
+    row_batch_size: int = 64,
     sub_qlayer: Tuple[int, int] = None,
 ):
     group_count = 1
@@ -544,6 +713,9 @@ def seed(
                     group_count,
                     num_iterations=num_iterations,
                     cd_cycles=cd_cycles,
+                    assignment_solver=assignment_solver,
+                    beam_width=beam_width,
+                    row_batch_size=row_batch_size,
                 )
 
                 io_executor.submit(
@@ -568,8 +740,13 @@ def seed(
                 group_count,
                 num_iterations=num_iterations,
                 cd_cycles=cd_cycles,
+                assignment_solver=assignment_solver,
+                beam_width=beam_width,
+                row_batch_size=row_batch_size,
             )
 
             layer_saver(luts_by_bit_by_module, parent_weights, log_dict, l)
             pb.update(1)
         pb.close()
+
+

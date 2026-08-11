@@ -252,7 +252,63 @@ def eval_ppl_sliding(model, tokenizer, testcases: List[str], ctx_len: int = 2048
 _DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
 
 
-def _load_model_and_tokenizer(model_path: str, dtype: torch.dtype, device_map: str):
+def _dequantize_anyprecision_state_dict(state_dict: dict, config, dtype: torch.dtype) -> dict:
+    from any_precision.quantization.finetune_utils import _dequantize_weight
+    from any_precision.quantization.pack import unpack_single_weight
+
+    parent_precision = int(config.anyprec["parent_precision"])
+    qweight_keys = [key for key in state_dict if key.endswith(".qweight")]
+    for qweight_key in tqdm(qweight_keys, desc="Dequantizing AP weights"):
+        module_name = qweight_key[: -len(".qweight")]
+        qweight = state_dict.pop(qweight_key)
+        num_bits = int(qweight.shape[0])
+        if num_bits != parent_precision:
+            raise ValueError(
+                f"{qweight_key} stores {num_bits} bits, but config parent_precision={parent_precision}"
+            )
+
+        lut_key = f"{module_name}.lut{num_bits}"
+        if lut_key not in state_dict:
+            raise KeyError(f"Missing LUT for {qweight_key}: expected {lut_key}")
+
+        codes = unpack_single_weight(qweight, num_bits)
+        codebooks = state_dict.pop(lut_key).unsqueeze(1)
+        state_dict[f"{module_name}.weight"] = _dequantize_weight(codes, codebooks).to(dtype)
+
+        lut_prefix = f"{module_name}.lut"
+        for key in [key for key in state_dict if key.startswith(lut_prefix)]:
+            state_dict.pop(key)
+
+    return state_dict
+
+
+def _load_anyprecision_as_dense(model_path: str, config, dtype: torch.dtype, device_map: str):
+    from transformers import AutoModelForCausalLM
+
+    checkpoint_path = Path(model_path) / "pytorch_model.bin"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Expected packed AnyPrecision checkpoint at {checkpoint_path}")
+
+    print("Loading AnyPrecision checkpoint as dense HF model; ap_gemv is not required.")
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _dequantize_anyprecision_state_dict(state_dict, config, dtype)
+
+    model = AutoModelForCausalLM.from_config(
+        config,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+    )
+    load_result = model.load_state_dict(state_dict, strict=False)
+    unexpected = [key for key in load_result.unexpected_keys if ".lut" in key or ".qweight" in key]
+    if unexpected:
+        raise RuntimeError(f"Packed AnyPrecision keys were not converted: {unexpected[:8]}")
+
+    if device_map != "cpu" and torch.cuda.is_available():
+        model = model.to("cuda")
+    return model
+
+
+def _load_model_and_tokenizer(model_path: str, dtype: torch.dtype, device_map: str, ap_load_mode: str = "dense"):
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
@@ -262,12 +318,15 @@ def _load_model_and_tokenizer(model_path: str, dtype: torch.dtype, device_map: s
         tokenizer.pad_token = tokenizer.eos_token
 
     if hasattr(config, "anyprec"):
-        from any_precision.modules.AnyPrecisionForCausalLM import AnyPrecisionForCausalLM
+        if ap_load_mode == "quantized":
+            from any_precision.modules.AnyPrecisionForCausalLM import AnyPrecisionForCausalLM
 
-        model = AnyPrecisionForCausalLM.from_quantized(
-            model_path,
-            torch_dtype=dtype,
-        )
+            model = AnyPrecisionForCausalLM.from_quantized(
+                model_path,
+                torch_dtype=dtype,
+            )
+        else:
+            model = _load_anyprecision_as_dense(model_path, config, dtype, device_map)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -298,6 +357,10 @@ def main():
                    help="only used with --method sliding")
     p.add_argument("--dtype", type=str, default="fp16", choices=list(_DTYPES))
     p.add_argument("--device-map", type=str, default="auto")
+    p.add_argument("--ap-load-mode", type=str, default="dense",
+                   choices=["dense", "quantized"],
+                   help="For packed AnyPrecision models: dense dequantizes to HF Linear and avoids ap_gemv; "
+                        "quantized uses AnyPrecisionLinear/ap_gemv.")
     p.add_argument("--cache-dir", type=str, default="./dataset_cache",
                    help="cache for tokenized corpora; '' to disable")
     p.add_argument("--out-json", type=str, default=None,
@@ -320,6 +383,7 @@ def main():
         args.model_path,
         dtype=dtype,
         device_map=args.device_map,
+        ap_load_mode=args.ap_load_mode,
     )
     model.eval()
 
@@ -359,3 +423,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

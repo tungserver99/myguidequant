@@ -1,3 +1,4 @@
+
 import os
 import os.path
 import shutil
@@ -6,7 +7,6 @@ import logging
 from .config import *
 from ..analyzer import get_analyzer
 from .activations import accumulate_saliency_weighted_hessians
-from .nll_hvp_saliency import collect_full_nll_hvp_saliencies, complete_saliency_cache_exists, log_cached_hessian_diagnostics
 from .layerwise_quantize import seed
 from .pack import pack
 from .datautils import get_tokens
@@ -22,22 +22,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # Disable parallelism in tokenizers to prevent warnings when forking in the seed generation step
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-
-def _resolve_hessian_source(hessian_source: str, curvature_mode: str = None) -> str:
-    if curvature_mode is None:
-        return hessian_source
-    if hessian_source != "saliency" and hessian_source != curvature_mode:
-        raise ValueError(
-            f"Conflicting curvature selectors: hessian_source={hessian_source!r}, "
-            f"curvature_mode={curvature_mode!r}"
-        )
-    return curvature_mode
-
-
-def _nll_global_hvp_tag(num_probes: int, seed_value: int, layer_chunk_size: int) -> str:
-    return f"nll_global_hvp_p{num_probes}_seed{seed_value}_lc{layer_chunk_size}_sum"
-
-
 def layerwise_nuq(
         model,
         seed_precision=DEFAULT_SEED_PRECISION,
@@ -48,20 +32,13 @@ def layerwise_nuq(
         overwrite_tokens=False,
         overwrite_quantize=False,
         overwrite_pack=False,
-        overwrite_saliency=False,
-        overwrite_hessians=False,
         random_state=None,
         num_groups=None,
         num_iterations=3,
         cd_cycles=4,
-        hessian_source="saliency",
-        curvature_mode=None,
-        nll_hvp_probes=1,
-        nll_hvp_seed=0,
-        nll_hvp_layer_chunk_size=1,
-        nll_hvp_sdpa_backend="math",
-        nll_hvp_saved_tensors_device="cpu",
-        sub_hessian=None,
+        assignment_solver='cd',
+        beam_width=8,
+        row_batch_size=64,
         sub_qlayer=None,
         is_nosal=False,
 ):
@@ -70,11 +47,6 @@ def layerwise_nuq(
 
     model_string = model if isinstance(model, str) else model.name_or_path
     model_name = model_string.split("/")[-1]
-    hessian_source = _resolve_hessian_source(hessian_source, curvature_mode)
-    if hessian_source not in ("saliency", "nll_global_hvp"):
-        raise ValueError(
-            f"Unsupported hessian_source={hessian_source!r}; expected 'saliency' or 'nll_global_hvp'"
-        )
 
     initialization_cache_path = (f"{cache_dir}/quantized/"
                           f"{model_name}-w{seed_precision}_orig{seed_precision}"
@@ -87,32 +59,24 @@ def layerwise_nuq(
                           f"{model_name}"
                           f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}")
 
-    hessian_suffix = "_nosal" if is_nosal else ""
-    if hessian_source == "nll_global_hvp":
-        nll_hvp_cache_tag = _nll_global_hvp_tag(
-            nll_hvp_probes,
-            nll_hvp_seed,
-            nll_hvp_layer_chunk_size,
-        )
-        saliency_cache_path = (f"{cache_dir}/saliency_nll_global_hvp/"
-                              f"{model_name}-{dataset}_s{num_examples}_blk{seq_len}"
-                              f"_g{num_groups}_{nll_hvp_cache_tag}")
-        hessians_cache_path = (f"{cache_dir}/hessians_nll_global_hvp/"
-                              f"{model_name}-{dataset}_s{num_examples}_blk{seq_len}"
-                              f"_g{num_groups}_{nll_hvp_cache_tag}")
-        hessian_suffix = f"_{nll_hvp_cache_tag}"
+    hessians_cache_path = (f"{cache_dir}/hessians/"
+                          f"{model_name}"
+                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{'_nosal' if is_nosal else ''}")
+
+    if assignment_solver == 'cd':
+        solver_tag = f"cd{cd_cycles}"
+    elif assignment_solver == 'rbvt':
+        solver_tag = f"rbvtB{beam_width}_cyc{cd_cycles}"
     else:
-        hessians_cache_path = (f"{cache_dir}/hessians/"
-                              f"{model_name}"
-                              f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}{hessian_suffix}")
+        raise ValueError(f"Unknown assignment_solver: {assignment_solver}")
 
     quantized_cache_path = (f"{cache_dir}/layerwise_quantized/"
                           f"{model_name}-w{seed_precision}"
-                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{hessian_suffix}")
+                          f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_{solver_tag}{'_nosal' if is_nosal else ''}")
 
     model_output_path = (f"{cache_dir}/layerwise_packed/"
                          f"layerwise-{model_name}-w{seed_precision}"
-                         f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_cd{cd_cycles}{hessian_suffix}")
+                         f"-{dataset}_s{num_examples}_blk{seq_len}_g{num_groups}_iter{num_iterations}_{solver_tag}{'_nosal' if is_nosal else ''}")
 
 
     # Logging with time sans date, level name, and message
@@ -134,19 +98,9 @@ def layerwise_nuq(
 
     logging.info(f"Initialization cache path: {initialization_cache_path}")
     logging.info(f"Tokens cache path: {tokens_cache_path}")
-    logging.info(f"Saliency cache path: {saliency_cache_path}")
     logging.info(f"Hessians cache path: {hessians_cache_path}")
     logging.info(f"Quantized cache path: {quantized_cache_path}")
     logging.info(f"Model output path: {model_output_path}")
-    logging.info(f"Hessian source: {hessian_source}")
-    logging.info(f"Overwrite saliency: {overwrite_saliency}")
-    logging.info(f"Overwrite hessians: {overwrite_hessians}")
-    if hessian_source == "nll_global_hvp":
-        logging.info(f"NLL global HVP probes: {nll_hvp_probes}")
-        logging.info(f"NLL global HVP seed: {nll_hvp_seed}")
-        logging.info(f"NLL global HVP layer chunk size: {nll_hvp_layer_chunk_size}")
-        logging.info(f"NLL global HVP SDPA backend: {nll_hvp_sdpa_backend}")
-        logging.info(f"NLL global HVP saved tensors device: {nll_hvp_saved_tensors_device}")
 
     # ------------------- Log mode and other options -------------------
 
@@ -165,21 +119,6 @@ def layerwise_nuq(
                             "Setting overwrite_pack to True.")
             overwrite_pack = True
 
-    if overwrite_hessians:
-        if not overwrite_quantize:
-            logging.warning("Quantized model needs to be recalculated if Hessians are recalculated. "
-                            "Setting overwrite_quantize to True.")
-            overwrite_quantize = True
-        if not overwrite_pack:
-            logging.warning("Packed model needs to be recalculated if Hessians are recalculated. "
-                            "Setting overwrite_pack to True.")
-            overwrite_pack = True
-
-    if overwrite_saliency:
-        overwrite_hessians = True
-        overwrite_quantize = True
-        overwrite_pack = True
-
     if mode == 'tokens':
         logging.info("Running: [Tokens]")
     elif mode == 'hessians':
@@ -196,9 +135,7 @@ def layerwise_nuq(
 
     analyzer = get_analyzer(model, yaml_path=yaml_path, include_tokenizer=True)
     module_names = analyzer.module_names
-    if sub_hessian is not None:
-        logging.warning("sub_hessian is accepted for CLI compatibility but is not used by layerwise_nuq.")
-
+    
     # ------------------- Get tokens -------------------
 
     logging.info("------------------- Get tokens -------------------")
@@ -208,44 +145,11 @@ def layerwise_nuq(
 
     if mode == 'tokens':
         return
-
+    
     # ------------------- Get Hessians -------------------
     logging.info("------------------- Get Hessians -------------------")
-    if overwrite_hessians and os.path.exists(hessians_cache_path):
-        logging.info(f"Detected cached Hessians at {hessians_cache_path}. Will delete and recalculate.")
-        shutil.rmtree(hessians_cache_path)
-
-    if hessian_source == "nll_global_hvp":
-        if overwrite_saliency and os.path.exists(saliency_cache_path):
-            logging.info(f"Detected cached NLL global HVP saliency at {saliency_cache_path}. Will delete and recalculate.")
-            shutil.rmtree(saliency_cache_path)
-        if overwrite_saliency or not complete_saliency_cache_exists(
-            analyzer,
-            saliency_cache_path,
-            num_examples,
-            seq_len,
-            num_groups,
-            num_probes=nll_hvp_probes,
-            base_seed=nll_hvp_seed,
-            layer_chunk_size=nll_hvp_layer_chunk_size,
-        ):
-            collect_full_nll_hvp_saliencies(
-                analyzer=analyzer,
-                input_tokens=tokens,
-                output_folder=saliency_cache_path,
-                num_groups=num_groups,
-                num_probes=nll_hvp_probes,
-                base_seed=nll_hvp_seed,
-                layer_chunk_size=nll_hvp_layer_chunk_size,
-                overwrite=overwrite_saliency,
-                sdpa_backend=nll_hvp_sdpa_backend,
-                saved_tensors_device=nll_hvp_saved_tensors_device,
-            )
-
     logging.info(f"Getting Hessians for {dataset} with sequence length {seq_len} and {num_examples} examples")
     from_cache = accumulate_saliency_weighted_hessians(analyzer, tokens, saliency_cache_path, hessians_cache_path, num_groups)
-    if hessian_source == "nll_global_hvp":
-        log_cached_hessian_diagnostics(analyzer, hessians_cache_path)
     logging.info("Hessians loading complete.")
 
     if mode == 'hessians':
@@ -283,6 +187,9 @@ def layerwise_nuq(
         cpu_count=cpu_count,
         num_iterations=num_iterations,
         cd_cycles=cd_cycles,
+        assignment_solver=assignment_solver,
+        beam_width=beam_width,
+        row_batch_size=row_batch_size,
         sub_qlayer=sub_qlayer,
     )
 
@@ -317,11 +224,4 @@ def layerwise_nuq(
     )
 
     logging.info("Packing complete.")
-
-
-
-
-
-
-
 
